@@ -4,7 +4,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-for suite in setup desktop-mode compatibility app-clones data-location image-download shares default-shares default-binder default-native-pool default-stop device components diagnostics features overlay portable-packaging camera migrate-source controller-takeover provision-support; do
+for suite in setup desktop-mode compatibility app-clones data-location image-download shares default-shares default-binder default-native-pool default-stop default-session-folder device components diagnostics features overlay portable-packaging camera backup inspect logs capture proxy performance migrate-source controller-takeover provision-support default-apps; do
   python3 "services/$suite-test.py"
 done
 for suite in compatibility shares runtime-actions; do
@@ -15,6 +15,7 @@ python3 -m unittest discover -s tests -p 'test_runtime_keymap*.py'
 python3 tests/test-keymap-codec-parity.py
 python3 -m unittest discover -s tests -p 'test_runtime_default_desktop.py'
 python3 -m unittest discover -s tests -p 'test_runtime_arm*.py'
+python3 -m unittest discover -s tests -p 'test_runtime_apk_install.py'
 python3 tests/acceptance/test-controls-harness.py
 python3 tests/acceptance/test-detached-editor.py
 python3 tests/acceptance/test-default-harness.py
@@ -40,7 +41,7 @@ import tempfile
 root = Path.cwd()
 features = {'runtime-features.py', 'runtime-compatibility.py', 'runtime-shares.py', 'runtime-default-shares.py',
             'runtime-device.py', 'runtime-components.py', 'runtime-diagnostics.py',
-            'runtime-notifications.py', 'notification-relay.py', 'runtime-camera.py'}
+            'runtime-notifications.py', 'notification-relay.py', 'runtime-camera.py', 'runtime-backup.py', 'runtime-inspect.py', 'runtime-logs.py', 'runtime-capture.py', 'runtime-proxy.py', 'runtime-performance.py'}
 installer = ast.parse((root / 'scripts/install-runtime-controller.py').read_text())
 modules = next(ast.literal_eval(node.value) for node in installer.body
                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MODULES' for t in node.targets))

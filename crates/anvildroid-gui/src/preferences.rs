@@ -183,6 +183,12 @@ fn recreate_main(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String>
 }
 
 pub fn show_main(app: &tauri::AppHandle) {
+    present_main(app, None);
+}
+
+/// Show the main window. `activation` is a launcher token (xdg-activation or
+/// startup notification) that lets the compositor give it focus.
+pub fn present_main(app: &tauri::AppHandle, activation: Option<&str>) {
     let window = match app.get_webview_window("main") {
         Some(window) => Some(window),
         None => recreate_main(app).map_err(|e| eprintln!("Cannot reopen AnvilDroid: {e}")).ok(),
@@ -194,6 +200,7 @@ pub fn show_main(app: &tauri::AppHandle) {
         #[cfg(target_os = "linux")]
         if let Ok(native) = window.gtk_window() {
             use gtk::prelude::*;
+            if let Some(token) = activation { native.set_startup_id(token); }
             native.present();
         }
     }

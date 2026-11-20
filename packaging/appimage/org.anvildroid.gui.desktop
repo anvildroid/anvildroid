@@ -2,7 +2,8 @@
 Type=Application
 Name=AnvilDroid
 Comment=Manage Android apps and runtimes on Linux
-Exec=anvildroid-gui
+Exec=anvildroid-gui %F
 Icon=org.anvildroid.gui
 Terminal=false
 Categories=System;
+MimeType=application/vnd.android.package-archive;application/x-android-package-bundle;

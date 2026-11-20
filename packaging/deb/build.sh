@@ -63,6 +63,7 @@ else
 fi
 fi
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true
+command -v update-mime-database >/dev/null 2>&1 && update-mime-database /usr/share/mime || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 exit 0
 EOF
@@ -96,6 +97,7 @@ case "$1" in
       systemctl daemon-reload
     fi
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true
+    command -v update-mime-database >/dev/null 2>&1 && update-mime-database /usr/share/mime || true
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
     ;;
 esac

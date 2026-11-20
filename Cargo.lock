@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "anvildroid-cli"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anvildroid-core",
  "serde_json",
@@ -51,10 +51,11 @@ dependencies = [
 
 [[package]]
 name = "anvildroid-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "dirs",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
@@ -62,11 +63,12 @@ dependencies = [
 
 [[package]]
 name = "anvildroid-gui"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anvildroid-core",
  "cc",
  "gtk",
+ "libc",
  "libloading",
  "serde",
  "serde_json",

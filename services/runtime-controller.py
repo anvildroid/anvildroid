@@ -285,6 +285,9 @@ class Store:
             if job['status'] == 'Running':
                 job.update(status='Failed', error='Controller interrupted; action outcome is unknown. Check the app before retrying.')
         if self.app_jobs: storage_module.atomic(self.app_jobs_path, self.app_jobs)
+        self.backups = features_module.backup.Backups(root, {r['id'] for r in self.data['runtimes']}, allow_temporary_storage)
+        try: self.backups.recover_default(self.existing)
+        except (OSError, RuntimeError, ValueError): pass  # retried by the next System Waydroid backup or restore
 
         self.deletions_path = root / 'deletions.json'
         self.deletions = read_file(self.deletions_path) if self.deletions_path.exists() else {}
@@ -319,6 +322,8 @@ class Store:
                     self.finish(record['id'], record['job']['id'], str(error))
             elif record['state'] in ('Starting', 'Running', 'Frozen', 'Stopping'):
                 self.reconcile(record)
+        # An interrupted restore may have left gigabytes in a device's staging folder.
+        self.pool.submit(self.backups.clean_managed, self)
 
     def login_start(self, uid):
         """Start the caller's start-on-login runtimes in the caller's desktop.
@@ -417,6 +422,7 @@ class Store:
                 relay = self.adb_relays.pop((uid, identifier), None)
                 if relay: relay.close()
         self.downloads.close()
+        self.backups.cancel_all()
         self.pool.shutdown(wait=True)
         os.close(self.lock)
 
@@ -742,6 +748,10 @@ class Store:
                 self.save({'schema_version': 3, 'runtimes': [r for r in self.data['runtimes'] if r['id'] != identifier]})
                 self.deletions.pop(identifier)
                 storage_module.atomic(self.deletions_path, self.deletions)
+            # A deleted device's backups cannot be restored. Unlinking large archives
+            # happens outside the mutex; the device is still reserved by this job.
+            try: self.backups.forget(identifier)
+            except (OSError, RuntimeError): pass
         except Exception as error:
             with self.mutex:
                 if any(r['id'] == identifier for r in self.data['runtimes']):
@@ -752,9 +762,9 @@ class Store:
                 self.active_jobs.discard(identifier)
                 if self.storage.busy == identifier: self.storage.busy = None
 
-    def install_job(self, identifier, job, fd):
+    def install_job(self, identifier, job, fd, parts=None):
         try:
-            result = self.android.install(identifier, fd)
+            result = self.android.install(identifier, fd) if parts is None else self.android.install(identifier, fd, parts)
             finished = dict(job, status='Succeeded', result=result)
         except Exception as error:
             finished = dict(job, status='Failed', error=str(error)[-1024:])
@@ -1156,6 +1166,13 @@ class Store:
     def dispatch(self, request, uid, apk_fd=None):
         if isinstance(request, dict) and request.get('op') == 'watch':
             return self.watch(request, uid, apk_fd)  # never holds the global lock while waiting
+        if apk_fd is not None and isinstance(request, dict) and request.get('op') == 'install':
+            # The caller's file may sit on a filesystem that stalls (FUSE, a network
+            # mount). Read it here, never under the lock every request waits for.
+            try:
+                if 'parts' in request: transfer.apk_parts(apk_fd, request['parts'])
+                else: transfer.apk_size(apk_fd)
+            except ValueError as error: raise RequestError('INVALID_APK', str(error))
         with self.mutex:
             result = copy.deepcopy(self._dispatch(request, uid, apk_fd))
             for record in result if isinstance(result, list) else [result]:
@@ -1196,7 +1213,7 @@ class Store:
             require(self.backend.source == Path('/var/lib/waydroid/images'), 'CONFIG', 'Import requires installed Waydroid images')
             require(self.existing.config().get('waydroid', 'images_path', fallback='') == str(self.backend.source),
                     'CONFIG', 'System Waydroid uses a different image directory; import cannot verify that image pair')
-            require(len(self.active_jobs) < 4 and self.storage.busy is None and
+            require(len(self.active_jobs) < 4 and self.storage.busy is None and 'default' not in self.active_jobs and
                     not any(self.imports.get(identifier) == 'pending' for identifier in self.active_jobs),
                     'BUSY', 'Wait for current operations to finish')
             record = self._dispatch({'op': 'create', 'name': request['name']}, uid)
@@ -1297,7 +1314,7 @@ class Store:
         arm_fields = ({'op', 'id', 'enabled'}, {'op', 'id', 'enabled', 'archive_sha256'})
         reinstall_fields = ({'op', 'id', 'flavor', 'confirmed_name'}, {'op', 'id', 'flavor', 'confirmed_name', 'system_sha256', 'vendor_sha256'})
         require(set(request) in reinstall_fields if operation == 'reinstall' else set(request) in arm_fields if operation == 'arm_set' else
-                (set(request) == fields[operation] or (operation == 'start' and set(request) == {'op', 'id', 'display'}) or (operation == 'app_action' and set(request) - fields[operation] in ({'activation_token'}, {'user'}, {'name'}, {'user', 'name'}) and fields[operation] <= set(request))),
+                (set(request) == fields[operation] or (operation == 'start' and set(request) == {'op', 'id', 'display'}) or (operation == 'install' and set(request) == {'op', 'id', 'parts'}) or (operation == 'app_action' and set(request) - fields[operation] in ({'activation_token'}, {'user'}, {'name'}, {'user', 'name'}) and fields[operation] <= set(request))),
                 'INVALID_REQUEST', 'Unexpected or missing fields')
         if 'activation_token' in request:
             token = request['activation_token']
@@ -1418,7 +1435,11 @@ class Store:
             require(record['state'] in ('Running', 'Frozen'), 'INVALID_STATE', 'Start this runtime before installing an APK')
             require(record['id'] not in self.active_jobs and len(self.active_jobs) < 4, 'BUSY', 'Wait for the runtime operation to finish')
             self.storage.ensure(record['id'])
-            try: transfer.apk_size(apk_fd)
+            # A split package is one file holding its APKs end to end; `parts` are their sizes.
+            # The file itself was checked before the lock was taken (see dispatch);
+            # only the announced sizes are looked at here, without touching it.
+            require(apk_fd is not None, 'INVALID_APK', 'APK file descriptor required')
+            try: parts = transfer.part_sizes(request['parts']) if 'parts' in request else None
             except ValueError as error: raise RequestError('INVALID_APK', str(error))
             job = {'id': uuid.uuid4().hex, 'runtime_id': record['id'], 'action': 'install', 'status': 'Running', 'error': None}
             owned_fd = os.dup(apk_fd)
@@ -1426,7 +1447,7 @@ class Store:
                 self.app_jobs[record['id']] = job
                 storage_module.atomic(self.app_jobs_path, self.app_jobs)
                 self.active_jobs.add(record['id'])
-                self.pool.submit(self.install_job, record['id'], dict(job), owned_fd)
+                self.pool.submit(self.install_job, record['id'], dict(job), owned_fd, parts)
             except Exception:
                 self.active_jobs.discard(record['id'])
                 os.close(owned_fd)
@@ -1727,7 +1748,7 @@ def validate_name(name):
 SLOW_OPERATIONS = frozenset({'arm_import', 'arm_set', 'components_set', 'diagnostics_collect', 'reinstall',
                              'existing_import', 'image_import', 'image_import_folder', 'health',
                              'system_integration', 'keymap_scheme', 'google_services',
-                             'compatibility_set', 'compatibility_reset'})
+                             'compatibility_set', 'compatibility_reset', 'backup_restore', 'network_set', 'performance_get', 'screenshot_save', 'logs_get'})
 IPC_WORKERS = 16
 SLOW_SLOTS = 8
 MAX_CONNECTIONS = 64

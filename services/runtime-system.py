@@ -183,6 +183,7 @@ class Integration:
         self.stopping = False
         self.stop_timer = None
         self.session_token = None
+        self.package_hold = existing.linux.PackageHold()
         self.original_mnt = original_mnt
         self.sharing = (default_shares.SessionMounts(
             Path('/var/lib/anvildroid-controller'),
@@ -256,6 +257,12 @@ class Integration:
         if self.sharing and self.sharing.active:
             raise RuntimeError('Default sharing cleanup is incomplete; retry Stop before starting')
         self.args = args
+        try:
+            if sync_user_runtime(session.get('user_id', '')):
+                logging.info('Attached the desktop session folder of user %s', session.get('user_id'))
+        except (OSError, RuntimeError) as error:
+            # Starting then fails with LXC's own message about the missing socket.
+            logging.warning('Desktop session folder is not visible to System Waydroid: %s', error)
         cfg = self.tools.config.load(args)
         for name in configured_binder_nodes(self.tools, args):
             try: ready = stat.S_ISCHR((Path('/dev') / name).stat().st_mode)
@@ -316,11 +323,12 @@ class Integration:
             # Waydroid width/height and the base properties remain untouched.
             props, report = workarea.boot_props(props, session['wayland_display'], int(session['user_id']))
             logging.info('Default desktop canvas: %s', report)
-            # App windows follow their host window only as freeform tasks.
-            # Android keeps a user's own choice in /data, which overrides this
-            # default; erased data (reinstall, first setup) has none.
-            if not any(p.startswith('persist.waydroid.multi_windows=') for p in props):
-                props.append('persist.waydroid.multi_windows=true')
+            # App windows follow their host window only as freeform tasks, so
+            # the bridge always starts in that mode. A value saved in /data
+            # would still win over this property; init.waydroid.rc applies it
+            # again after loading that data (linux.window_mode_init).
+            props = [p for p in props if not p.startswith('persist.waydroid.multi_windows=')]
+            props.append('persist.waydroid.multi_windows=true')
         if self.nvidia:
             # make_prop precedes its bind mount; base properties are kept for
             # the next Intel/AMD boot, including all user's other settings.
@@ -405,7 +413,28 @@ class Integration:
             if stat.S_ISREG(lease.st_mode) and lease.st_uid == 0 and not lease.st_mode & 0o077 and time.time() - lease.st_mtime < 12:
                 return
         except (OSError, RuntimeError): pass
+        if self.installing_package(args):
+            # Android asks for this once, when it goes to sleep. It then stays
+            # awake until it next goes to sleep after the installation.
+            logging.info('Default freeze skipped: Android is installing a package')
+            return
         return self.original_freeze(args)
+
+    def installing_package(self, args):
+        """Android is committing an install, by itself or for AnvilDroid.
+
+        Frozen now, it would keep its install lock across the sleep and its
+        watchdog would restart the system process after the next resume.
+        Any doubt means no: the freeze then goes ahead as it always did.
+        """
+        try:
+            if self.tools.helpers.lxc.status(args) != 'RUNNING': return False
+            output = existing.linux.run_bounded('lxc-attach', '-P', '/var/lib/waydroid/lxc', '-n', 'waydroid',
+                '--', '/system/bin/sh', '-c', existing.linux.PACKAGE_SESSIONS, timeout=3, full_output=True,
+                output_limit=1024 * 1024, operation='Default package activity check')
+        except (OSError, RuntimeError):
+            return False
+        return self.package_hold.busy(existing.linux.package_sessions(output), time.monotonic())
 
     def stop(self, args, quit_session=True):
         if self.stopping:
@@ -515,6 +544,62 @@ class Integration:
         if self.sharing and self.sharing.active:
             if wait: self.sharing.close(True)
             else: self.sharing.close(True, wait=False)
+
+
+# Runs as a short single-threaded child: setns() to a mount namespace needs
+# that. It clones the host's mount of one directory and attaches the clone in
+# this service's namespace. x86_64 syscall numbers: setns 308, open_tree 428,
+# move_mount 429. The path is the only argument and is checked by the caller.
+ATTACH_HOST_MOUNT = r"""
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+path = sys.argv[1].encode()
+def call(name, *args):
+    if libc.syscall(*args) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, name + ': ' + os.strerror(error))
+ours = os.open('/proc/self/ns/mnt', os.O_RDONLY)
+host = os.open('/proc/1/ns/mnt', os.O_RDONLY)
+call('setns', ctypes.c_long(308), ctypes.c_int(host), ctypes.c_int(0x00020000))
+tree = libc.syscall(ctypes.c_long(428), ctypes.c_int(-100), ctypes.c_char_p(path), ctypes.c_uint(1 | 0x80000))
+if tree < 0:
+    error = ctypes.get_errno()
+    raise OSError(error, 'open_tree: ' + os.strerror(error))
+call('setns', ctypes.c_long(308), ctypes.c_int(ours), ctypes.c_int(0x00020000))
+call('move_mount', ctypes.c_long(429), ctypes.c_int(tree), ctypes.c_char_p(b''), ctypes.c_int(-100),
+     ctypes.c_char_p(path), ctypes.c_uint(4))
+"""
+
+
+def sync_user_runtime(user_id, base=Path('/run/user'), host=Path('/proc/1/root'), run=None, mounted=os.path.ismount):
+    """Show the desktop user's runtime directory in this private mount namespace.
+
+    This service usually starts at boot, before anyone logs in. The tmpfs that
+    appears at /run/user/<uid> at login is a new host mount and never reaches
+    this namespace, so the session's Wayland and audio sockets would be missing
+    and the container could not start. A later login replaces that tmpfs again.
+    Returns True when the directory was attached."""
+    uid = str(user_id)
+    if not uid.isdecimal() or len(uid) > 10:
+        return False
+    local = base / uid
+    try:
+        theirs = (host / local.relative_to('/')).stat()
+    except OSError:
+        return False                      # nobody is logged in: nothing to show
+    try:
+        ours = local.stat()
+        if (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino):
+            return False                  # already the same directory
+    except FileNotFoundError:
+        local.mkdir(mode=0o700, parents=True)
+    run = run or (lambda *argv: existing.linux.run_bounded(*argv, timeout=10, operation='Desktop session folder'))
+    if mounted(local):
+        run('umount', '-l', local)        # the folder of an earlier login
+    run(sys.executable, '-I', '-S', '-c', ATTACH_HOST_MOUNT, local)
+    run('mount', '--make-private', local)
+    return True
 
 
 def main():

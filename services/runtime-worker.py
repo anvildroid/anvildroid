@@ -51,6 +51,10 @@ linux = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(linux)
 run, require = linux.run, linux.require
 
+spec = importlib.util.spec_from_file_location('runtime_inspect', Path(__file__).with_name('runtime-inspect.py'))
+inspect = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspect)
+
 spec = importlib.util.spec_from_file_location('runtime_gpu', Path(__file__).with_name('runtime-gpu.py'))
 gpu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gpu)
@@ -148,6 +152,19 @@ class IdleSuspend:
         self.idle_since = None
         self.last_action = time.monotonic()
         self.apps = None
+        self.packages = linux.PackageHold()
+        self.installing = False
+        self.frozen_at = None
+
+    def package_work(self, now):
+        """Android is committing an install. Asked on its own, within its own
+        limits: no answer, or one that is too long, means there is no hold,
+        so a slow or large session list can never keep the device awake."""
+        try:
+            listing = self.lxc('lxc-attach', '--', '/system/bin/sh', '-c', linux.PACKAGE_SESSIONS)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            return False
+        return self.packages.busy(linux.package_sessions(listing), now)
 
     def lxc(self, tool, *args):
         return linux.run_bounded(tool, '-P', self.instance / 'android', '-n', self.identifier,
@@ -161,6 +178,11 @@ class IdleSuspend:
             require(self.lxc('lxc-info', '-sH').strip() == 'RUNNING', 'Android did not resume')
             self.state['state'] = 'Running'
             print('Android resumed from idle suspend', flush=True)
+            # Time spent asleep does not use up a session's allowance; a session
+            # that already used it up does not get a new one with every resume.
+            if self.frozen_at is not None:
+                self.packages.slept(max(0, time.monotonic() - self.frozen_at))
+            self.frozen_at = None
         self.last_action = time.monotonic()
         self.idle_since = None
 
@@ -189,6 +211,17 @@ class IdleSuspend:
             if not idle_snapshot(output):
                 self.idle_since = None
                 return
+            # Freezing in the middle of an install leaves Android's install
+            # lock held across the sleep; its watchdog then restarts the system
+            # process soon after the next resume.
+            installing = self.package_work(now)
+            if installing != self.installing:
+                self.installing = installing
+                print('Idle suspend ' + ('waits: Android is installing a package' if installing
+                                         else 'no longer waits for a package installation'), flush=True)
+            if installing:
+                self.idle_since = None
+                return
             if self.idle_since is None: self.idle_since = now
             if now - max(self.idle_since, self.last_action) < self.grace: return
             # Preserve inventory before sleeping; polling can serve it without
@@ -199,6 +232,7 @@ class IdleSuspend:
             self.lxc('lxc-freeze')
             require(self.lxc('lxc-info', '-sH').strip() == 'FROZEN', 'Android did not suspend')
             self.state['state'] = 'Frozen'
+            self.frozen_at = now
             print('Android suspended after 60s with no app windows or foreground services', flush=True)
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
             self.idle_since = None
@@ -536,28 +570,165 @@ def show_android_ui(instance, identifier):
     # Do not change immersive policy, verification settings, or click a dialog.
 
 
-def install_apk(instance, identifier, fd, desktop=False):
-    size = transfer.apk_size(fd)
-    before = os.fstat(fd)
-    with tempfile.TemporaryFile(dir=instance) as snapshot:
+def await_package_service(instance, identifier, limit=60, pause=time.sleep):
+    """Wait, within a limit, until Android can take an installation.
+
+    The package service must answer: it is missing while Android's system
+    process restarts. An installation Android is already committing is given
+    time to end first. One that was suspended half way keeps the install lock,
+    and Android's watchdog may restart the system process within a minute of
+    the resume; a request queued behind it would be lost in that restart.
+    """
+    deadline = time.monotonic() + limit
+    while True:
+        ready = False
+        try:
+            output = linux.run_bounded('lxc-attach', '-P', instance / 'android', '-n', identifier,
+                                       '--', '/system/bin/sh', '-c', linux.PACKAGE_PROBE, timeout=8, umask=0o022,
+                                       full_output=True, output_limit=1024 * 1024, operation='Package service check')
+            ready = linux.package_ready(output)
+            if ready and not linux.package_sessions(output): return
+        except RuntimeError: pass  # Android did not answer in time; ask again.
+        if time.monotonic() >= deadline: break
+        pause(2)
+    # A long installation of Android's own is no reason to refuse this one.
+    require(ready, 'Android is restarting and its package service is not ready yet. Nothing was installed.')
+
+
+def succeeded(output):
+    """Android printed a Success line; warnings before it do not matter."""
+    return any(line.strip().startswith('Success') for line in output.splitlines())
+
+
+def install_session(instance, identifier, snapshot, sizes, desktop, started=None):
+    """Install the APKs held end to end in `snapshot` as one Android session."""
+    def pm(*args, timeout, operation, stdin=subprocess.DEVNULL):
+        return linux.run_bounded('lxc-attach', '-P', instance / 'android', '-n', identifier,
+                                 '--', '/system/bin/pm', *args, stdin=stdin, timeout=timeout, umask=0o022, operation=operation)
+    def abandon(session):
+        try: pm('install-abandon', session, timeout=15, operation='APK session cleanup')
+        except RuntimeError: pass
+    def abandon_unknown(since_ms):
+        # The session number is unknown, so find it: only this worker creates
+        # sessions as root in this device, and it installs one package at a time.
+        try:
+            listing = linux.run_bounded('lxc-attach', '-P', instance / 'android', '-n', identifier,
+                                        '--', '/system/bin/sh', '-c', linux.PACKAGE_SESSIONS, timeout=8, umask=0o022,
+                                        full_output=True, output_limit=1024 * 1024, operation='APK session cleanup')
+        except RuntimeError: return
+        for session in sorted(linux.open_sessions(listing, 0, since_ms)): abandon(session)
+    if started is None: started = time.monotonic()
+    since_ms = int(time.time() * 1000) - 1000
+    try:
+        created = pm('install-create', '-r', '--user', '0', '-S', sum(sizes), timeout=30, operation='APK session')
+    except RuntimeError as error:
+        # Android may have opened the session before the command failed or timed out.
+        abandon_unknown(since_ms)
+        raise RuntimeError(str(error)[-900:].rstrip('.') + '. Nothing was installed.') from error
+    match = re.search(r'(?m)^\s*Success\b.*\[(\d+)\]', created) or re.search(r'install session \[(\d+)\]', created)
+    if match is None or not succeeded(created):
+        if match is not None: abandon(match.group(1))
+        else: abandon_unknown(since_ms)
+        raise RuntimeError('Android did not open an install session: ' + created[:512].rstrip('.') + '. Nothing was installed.')
+    session = match.group(1)
+    try:
         offset = 0
-        while offset < size:
-            block = os.pread(fd, min(1024 * 1024, size - offset), offset)
-            require(bool(block), 'APK changed while reading; retry')
-            snapshot.write(block)
-            offset += len(block)
-        after = os.fstat(fd)
-        require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'APK changed while reading; retry')
-        snapshot.seek(0)
+        for index, size in enumerate(sizes):
+            remaining = started + 150 - time.monotonic()
+            require(remaining > 0, 'Android took too long to receive the split package')
+            # Without a path argument pm reads exactly `size` bytes of stdin.
+            os.lseek(snapshot.fileno(), offset, os.SEEK_SET)
+            written = pm('install-write', '-S', size, session, f'{index}.apk', stdin=snapshot, timeout=remaining, operation='APK transfer')
+            require(succeeded(written), 'Android rejected a split APK: ' + written[:512])
+            offset += size
+        # Still before the commit: a failure here must not strand the session.
         if desktop:
+            show_android_ui(instance, identifier)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        # Nothing is committed yet, so the session can be dropped safely.
+        abandon(session)
+        raise RuntimeError(str(error)[-900:].rstrip('.') + '. Nothing was installed.') from error
+    # After this point the outcome belongs to Android: never abandon or repeat.
+    return pm('install-commit', session, timeout=max(30, started + 300 - time.monotonic()), operation='APK installation')
+
+
+# Free space kept on the disk that holds a device while a package is copied.
+SNAPSHOT_RESERVE = 256 * 1024 * 1024
+SNAPSHOT_TIMEOUT = 120
+
+
+def free_bytes(directory):
+    info = os.statvfs(directory)
+    return info.f_bavail * info.f_frsize
+
+
+def snapshot_package(fd, snapshot, limit, directory, timeout=SNAPSHOT_TIMEOUT, poll=0.25):
+    """Copy at most `limit` bytes of the caller's file into root's snapshot.
+
+    The caller's file may sit on a filesystem that stalls (FUSE, a network
+    mount) or be something that never ends. A child process does the reading,
+    so this worker waits a bounded time and never touches the file itself;
+    the copy stops when the disk that holds the device is about to fill up.
+    """
+    def full(needed=0):
+        return free_bytes(directory) < needed + SNAPSHOT_RESERVE
+    def stop(process):
+        try: os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        try: process.wait(timeout=5)
+        except subprocess.TimeoutExpired: pass  # stuck in the kernel; it holds nothing of ours
+    space = 'Not enough free space on the disk that holds this device to receive the package. Free some space and retry. Nothing was installed.'
+    require(not full(), space)
+    # The descriptor's position is shared with the caller; start at the beginning.
+    try: os.lseek(fd, 0, os.SEEK_SET)
+    except OSError as error: raise RuntimeError('The package must be a regular file. Nothing was installed.') from error
+    process = subprocess.Popen(['head', '-c', str(limit)], stdin=fd, stdout=snapshot, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            code = process.wait(timeout=poll)
+            break
+        except subprocess.TimeoutExpired:
+            if full():
+                stop(process)
+                raise RuntimeError(space)
+            if time.monotonic() >= deadline:
+                stop(process)
+                raise RuntimeError('Reading the package file took too long. Copy it to a local folder and retry. Nothing was installed.')
+    require(code == 0, 'The package file could not be read. Nothing was installed.')
+
+
+def install_apk(instance, identifier, fd, desktop=False, parts=None, started=None):
+    # `started` is when the request began: the caller waits 330 seconds in all.
+    if started is None: started = time.monotonic()
+    expected = None if parts is None else sum(transfer.part_sizes(parts))
+    with tempfile.TemporaryFile(dir=instance) as snapshot:
+        if expected is not None:
+            require(free_bytes(instance) >= expected + SNAPSHOT_RESERVE,
+                    f'Not enough free space on the disk that holds this device: {-(-expected // 2**20)} MB are needed to receive the package. Nothing was installed.')
+        # One byte more than allowed shows a file that is longer than announced.
+        snapshot_package(fd, snapshot, (transfer.MAX_APK if expected is None else expected) + 1, instance)
+        # Everything is checked on the snapshot: it is what Android receives.
+        try:
+            sizes = [transfer.apk_size(snapshot.fileno())] if parts is None else transfer.apk_parts(snapshot.fileno(), parts)
+        except ValueError as error:
+            raise RuntimeError(str(error) + '. Nothing was installed.') from error
+        size = sum(sizes)
+        os.lseek(snapshot.fileno(), 0, os.SEEK_SET)
+        if parts is None and desktop:
             show_android_ui(instance, identifier)
         # No positional path selects stdin; a bare dash is parsed as an option on Android 13.
         try:
-            output = linux.run_bounded('lxc-attach', '-P', instance / 'android', '-n', identifier,
+            if parts is not None:
+                output = install_session(instance, identifier, snapshot, sizes, desktop, started)
+            else:
+                output = linux.run_bounded('lxc-attach', '-P', instance / 'android', '-n', identifier,
                                        '--', '/system/bin/pm', 'install', '-r', '--user', '0', '-S', size,
-                                       stdin=snapshot, timeout=300, umask=0o022, operation='APK installation')
+                                       stdin=snapshot, timeout=max(30, started + 300 - time.monotonic()),
+                                       umask=0o022, operation='APK installation')
         except RuntimeError as error:
-            if 'command timed out' in str(error):
+            if 'APK installation command timed out' in str(error):
                 raise RuntimeError('Android did not confirm installation within 5 minutes. It may still be optimizing the app or waiting for verification. Check the Android window and installed app list before retrying; the installation outcome is unknown.') from error
             raise
     require(any(line.strip() == 'Success' for line in output.splitlines())
@@ -1798,9 +1969,12 @@ def boot(instance, identifier, generation, state, stopping, done, desktop=None, 
                 # Stock custom composers commonly implement only Waydroid's
                 # single-display path. Enabling multi-window makes them
                 # recreate the HWC layer and abort when the first app opens.
-                props += [('persist.waydroid.multi_windows=false' if (single_display or (software_compatibility and not native_app_windows))
-                           else 'persist.waydroid.multi_windows=true'),
+                multi_windows = not (single_display or (software_compatibility and not native_app_windows))
+                props += ['persist.waydroid.multi_windows=' + ('true' if multi_windows else 'false'),
                           f'waydroid.host.uid={desktop[1]}']
+                # The property alone is only a default: a value saved in the
+                # device's data would win. init applies it at every start.
+                config_text = linux.window_mode_init(config_text, multi_windows)
                 if single_display:
                     props = single_display_properties(props)
                 props += workarea_props
@@ -2233,8 +2407,8 @@ def main(instance, identifier, generation, original_mnt, original_net, desktop=N
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     endpoint = instance / 'worker.sock'
     endpoint.unlink(missing_ok=True)
-    state = dict(runtime_id=identifier, generation=generation, state='Starting', error=None, display_mode='desktop', capabilities=['graphics', 'apps', 'app_actions', 'uninstall_app', 'install_apk', 'google_services'])
-    state['capabilities'].extend(['app_states', 'adb', 'app_compatibility', 'shared_folders'])
+    state = dict(runtime_id=identifier, generation=generation, state='Starting', error=None, display_mode='desktop', capabilities=['graphics', 'apps', 'app_actions', 'uninstall_app', 'install_apk', 'install_splits', 'google_services'])
+    state['capabilities'].extend(['app_states', 'adb', 'app_compatibility', 'shared_folders', 'inspect'])
     if desktop: state['capabilities'].extend(['keymap_editor', 'keymap_schemes', 'full_ui', 'window_activation'])
     atomic(instance / 'worker-identity.json', dict(runtime_id=identifier, generation=generation))
     (instance / 'worker-result.json').unlink(missing_ok=True)
@@ -2272,7 +2446,7 @@ def main(instance, identifier, generation, original_mnt, original_net, desktop=N
                 apk_fd = None
                 try:
                     request, apk_fd = transfer.receive(connection, 65536)
-                    if apk_fd is not None and (not isinstance(request, dict) or request.get('op') != 'install'):
+                    if apk_fd is not None and (not isinstance(request, dict) or request.get('op') not in ('install', 'inspect')):
                         raise ValueError('Unexpected file descriptor')
                     if request == {'op': 'stop'}:
                         if state['state'] != 'Error': state['state'] = 'Stopping'
@@ -2341,6 +2515,18 @@ def main(instance, identifier, generation, original_mnt, original_net, desktop=N
                             response['graphics_error'] = str(error)[-1024:]
                         connection.sendall(json.dumps(dict(response, state=state['state'])).encode() + b'\n')
                         continue
+                    elif isinstance(request, dict) and request.get('op') == 'inspect':
+                        # Device tools never wake a sleeping Android.
+                        response = dict(state)
+                        try:
+                            require(state['state'] != 'Frozen', inspect.ASLEEP)
+                            require(state['state'] == 'Running' and not stopping.is_set(), inspect.STOPPED)
+                            response['inspect_result'] = inspect.worker_request(request, apk_fd, generation,
+                                                                                instance / 'android', identifier)
+                        except Exception as error:   # parsers read hostile Android text: never take the worker down
+                            response['inspect_error'] = (str(error) or type(error).__name__)[-1024:]
+                        connection.sendall(json.dumps(dict(response, state=state['state'])).encode() + b'\n')
+                        continue
                     elif request == {'op': 'google_services'}:
                         response = dict(state)
                         try:
@@ -2402,11 +2588,15 @@ def main(instance, identifier, generation, original_mnt, original_net, desktop=N
                     elif isinstance(request, dict) and request.get('op') == 'install':
                         response = dict(state)
                         try:
-                            require(set(request) == {'op', 'generation'}, 'Invalid install request')
+                            require(set(request) in ({'op', 'generation'}, {'op', 'generation', 'parts'}), 'Invalid install request')
                             require(request['generation'] == generation, 'Worker generation changed; installation refused')
                             idle.resume()
                             require(state['state'] == 'Running' and not stopping.is_set(), 'Android is not running')
-                            response['app_result'] = install_apk(instance, identifier, apk_fd, desktop=bool(desktop))
+                            install_started = time.monotonic()
+                            await_package_service(instance, identifier)
+                            response['app_result'] = install_apk(instance, identifier, apk_fd, desktop=bool(desktop),
+                                                                 parts=request.get('parts'), started=install_started)
+                            idle.last_action = time.monotonic()
                         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
                             response['app_error'] = str(error)[-1024:]
                         connection.sendall(json.dumps(dict(response, state=state['state'])).encode() + b'\n')

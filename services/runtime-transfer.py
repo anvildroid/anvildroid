@@ -7,6 +7,9 @@ import socket
 import stat
 
 MAX_APK = 2 * 1024 * 1024 * 1024
+# One split package: its APKs laid end to end in a single caller-opened file.
+MAX_PARTS = 512
+MAX_SET = 4 * 1024 * 1024 * 1024
 
 def apk_size(fd):
     if fd is None: raise ValueError('APK file descriptor required')
@@ -17,6 +20,29 @@ def apk_size(fd):
         raise ValueError('APK descriptor must be readable')
     if os.pread(fd, 4, 0) != b'PK\x03\x04': raise ValueError('File is not an APK archive')
     return info.st_size
+
+def part_sizes(parts):
+    """Check the announced APK sizes of a split package; touches no file."""
+    if (not isinstance(parts, list) or not 2 <= len(parts) <= MAX_PARTS
+            or any(type(size) is not int or not 0 < size <= MAX_APK for size in parts)
+            or sum(parts) > MAX_SET):
+        raise ValueError('A split package needs 2 to 512 APK sizes of at most 2 GiB each and 4 GiB in total')
+    return list(parts)
+
+def apk_parts(fd, parts):
+    """Validate the APK sizes that divide one caller-opened file; return them."""
+    if fd is None: raise ValueError('APK file descriptor required')
+    parts = part_sizes(parts)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size != sum(parts):
+        raise ValueError('Split package must be a regular file of exactly the announced APK sizes')
+    if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY:
+        raise ValueError('APK descriptor must be readable')
+    offset = 0
+    for size in parts:
+        if os.pread(fd, 4, offset) != b'PK\x03\x04': raise ValueError('File is not an APK archive')
+        offset += size
+    return parts
 
 def receive(connection, limit=16384):
     descriptors = []

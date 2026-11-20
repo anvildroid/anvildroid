@@ -270,6 +270,9 @@ class ExistingRuntime:
         if text.count(marker) != 1:
             raise RuntimeError('Default desktop composer configuration is unsupported')
         text = re.sub(r'^    setenv ANVILDROID_RUNTIME_(?:ID|GENERATION) .*\n', '', text, flags=re.M)
+        # With the bridge every app is a desktop window, which needs freeform
+        # tasks whatever value Android saved earlier.
+        text = linux.window_mode_init(text, True)
         return text.replace(marker, marker + '    setenv ANVILDROID_RUNTIME_ID default\n' +
                             '    setenv ANVILDROID_RUNTIME_GENERATION ' + uuid.uuid4().hex + '\n')
 

@@ -1,6 +1,6 @@
 //! Desktop actions pinned to an owner-authorized controller runtime.
 use crate::{
-    backend,
+    apps, backend,
     controller::{self, Request},
     error::AnvilError,
     library,
@@ -112,9 +112,42 @@ fn launch_with(
     }
 }
 
-/// Wait for the exact accepted install job, without following a later action.
 pub fn install(id: &str, path: &std::path::Path) -> Result<(), AnvilError> {
-    let mut job = controller::install(id, path).map_err(AnvilError::BackendFailed)?;
+    install_through_restart(|| {
+        let job = controller::install(id, path).map_err(AnvilError::BackendFailed)?;
+        await_install(id, job)
+    })
+}
+
+/// Submit an install again when it failed only because Android's system
+/// process restarted under it. A result that is unknown is never repeated:
+/// see `apps::retry_after_restart`.
+fn install_through_restart(submit: impl FnMut() -> Result<(), AnvilError>) -> Result<(), AnvilError> {
+    let deadline = Instant::now() + apps::RESTART_WAIT;
+    apps::retry_after_restart(submit, || {
+        std::thread::sleep(apps::RESTART_PAUSE);
+        Instant::now() < deadline
+    })
+}
+
+/// Install the APKs of one package as one Android session. The controller
+/// receives one caller-opened file and the size of each APK in it.
+pub fn install_set(id: &str, set: &crate::apk_set::PackageSet) -> Result<(), AnvilError> {
+    if backend::uninstall_block_reason(&set.package).is_some() {
+        return Err(AnvilError::InvalidArgument(
+            "Runtime components must be updated through the runtime installer.".into(),
+        ));
+    }
+    let (file, sizes) = set.transfer_file()?;
+    // The controller reads the file by position, so it can be sent again.
+    install_through_restart(|| {
+        let job = controller::install_parts(id, &file, &sizes).map_err(AnvilError::BackendFailed)?;
+        await_install(id, job)
+    })
+}
+
+/// Wait for the exact accepted install job, without following a later action.
+fn await_install(id: &str, mut job: Value) -> Result<(), AnvilError> {
     let job_id = job["id"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -160,6 +193,38 @@ pub fn install(id: &str, path: &std::path::Path) -> Result<(), AnvilError> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn install_job_is_submitted_again_only_when_android_restarted_under_it() {
+        // Job errors as the controller reports them for a managed device.
+        let failed = |text: &str| Err(AnvilError::BackendFailed(text.into()));
+        let mut jobs = vec![
+            failed("APK installation failed: cmd: Failure calling service package: Broken pipe (32)"),
+            failed("APK session failed: cmd: Can't find service: package"),
+            failed("Android is restarting and its package service is not ready yet. Nothing was installed."),
+            Ok(()),
+        ].into_iter();
+        let mut pauses = 0;
+        apps::retry_after_restart(|| jobs.next().unwrap(), || { pauses += 1; true }).unwrap();
+        assert_eq!((pauses, jobs.next().is_none()), (3, true));
+        // Unknown outcomes and real rejections are reported after one attempt.
+        for text in [
+            "Android did not confirm installation within 5 minutes. It may still be optimizing the app or waiting for verification. Check the Android window and installed app list before retrying; the installation outcome is unknown.",
+            "Android did not confirm installation in time. It may still be installing the app. Check the Android window and the installed app list before retrying; the installation outcome is unknown.",
+            "Worker changed during installation; the installation outcome is unknown. Check before retrying.",
+            "Invalid installation result; the installation outcome is unknown. Check before retrying.",
+            "APK installation failed: Failure [INSTALL_FAILED_VERSION_DOWNGRADE]",
+            "Installation job changed; check this runtime in Settings before retrying.",
+        ] {
+            let mut attempts = 0;
+            let error = apps::retry_after_restart(|| { attempts += 1; failed(text) }, || panic!("must not wait: {text}")).unwrap_err();
+            assert_eq!((attempts, error.to_string().contains(text)), (1, true));
+        }
+        let error = apps::retry_after_restart::<()>(
+            || Err(AnvilError::Timeout("Installation result is unknown. Check this runtime in Settings before retrying.".into())),
+            || panic!("must not wait"),
+        ).unwrap_err();
+        assert!(matches!(error, AnvilError::Timeout(_)));
+    }
     #[test]
     fn frozen_shortcut_routes_to_existing_worker_without_starting_another() {
         let id = "r-11111111111111111111111111111111";

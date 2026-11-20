@@ -7,6 +7,8 @@ use anvildroid_core::{apps, backend, desktop, launch, library, runtime, scope};
 use tauri::{Manager, State};
 
 #[cfg(target_os = "linux")]
+mod open_file;
+mod device_log;
 mod titlebar;
 mod preferences;
 mod custom_download;
@@ -298,6 +300,19 @@ async fn runtime_controller(
 #[tauri::command]
 async fn export_runtime_diagnostics(id: String, path: String, include_logs: bool) -> Result<serde_json::Value, String> {
     blocking(move || anvildroid_core::diagnostics::export(&id, std::path::Path::new(&path), include_logs)).await
+}
+
+/// Save a PNG of the device's Android display. The save dialog already asked
+/// before replacing an existing file.
+#[tauri::command]
+async fn save_device_screenshot(id: String, path: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let path = std::path::Path::new(&path);
+        if !path.is_absolute() {
+            return Err("Choose where to save the screenshot".into());
+        }
+        anvildroid_core::controller::screenshot_to(&id, path, true)
+    }).await
 }
 
 #[tauri::command]
@@ -922,28 +937,68 @@ async fn remove_app_shortcut(
     }).await)
 }
 
+/// The files the Install dialog prepared, kept until the dialog is done.
+/// Only one selection is alive at a time; a new one replaces it.
+#[derive(Default)]
+struct ApkPlans(Arc<Mutex<(u64, Option<Arc<anvildroid_core::apk_set::Prepared>>)>>);
+
+/// Inspect the selected files once: group APKs into packages and unpack bundles.
 #[tauri::command]
-async fn install_apk(
+async fn prepare_apk_install(paths: Vec<String>, plans: State<'_, ApkPlans>) -> Result<serde_json::Value, String> {
+    use anvildroid_core::apk_set;
+    let plans = plans.0.clone();
+    blocking(move || {
+        // Free the previous selection first: unpacked bundles can be large.
+        plans.lock().unwrap_or_else(|e| e.into_inner()).1 = None;
+        let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        let prepared = apk_set::prepare(&paths).map_err(|e| e.to_string())?;
+        let packages: Vec<_> = prepared.packages.iter().map(|set| serde_json::json!({
+            "name": apk_set::describe(set), "package": set.package, "apks": set.parts.len(),
+            "bytes": set.bytes(), "notice": apk_set::obb_notice(set),
+        })).collect();
+        let rejected: Vec<_> = prepared.rejected.iter()
+            .map(|rejected| serde_json::json!({"file": rejected.file, "reason": rejected.reason})).collect();
+        let mut plans = plans.lock().unwrap_or_else(|e| e.into_inner());
+        plans.0 += 1;
+        let plan = plans.0;
+        plans.1 = (!packages.is_empty()).then(|| Arc::new(prepared));
+        Ok(serde_json::json!({"plan": plan, "packages": packages, "rejected": rejected}))
+    }).await
+}
+
+/// Install one prepared package into one device, as one Android session.
+#[tauri::command]
+async fn install_prepared_apk(
     runtime_id: String,
-    path: String,
+    plan: u64,
+    index: usize,
     guard: State<'_, OpGuard>,
+    plans: State<'_, ApkPlans>,
 ) -> Result<OperationResult, ()> {
     let guard = guard.0.clone();
+    let plans = plans.0.clone();
     Ok(blocking(move || {
         let Ok(_operation) = guard.try_lock() else {
             return busy_result();
         };
+        let prepared = {
+            let plans = plans.lock().unwrap_or_else(|e| e.into_inner());
+            plans.1.clone().filter(|_| plans.0 == plan)
+        };
+        let Some(set) = prepared.as_ref().and_then(|prepared| prepared.packages.get(index)) else {
+            return op_result_err(AnvilError::InvalidArgument("The selected files are no longer prepared. Choose them again.".into()));
+        };
+        let name = anvildroid_core::apk_set::describe(set);
         if library::valid_managed_runtime(&runtime_id) {
-            return match anvildroid_core::managed::install(&runtime_id, std::path::Path::new(&path)) {
-                Ok(()) => op_result_ok("APK installed successfully in the selected runtime. Android confirmed installation."),
+            return match anvildroid_core::managed::install_set(&runtime_id, set) {
+                Ok(()) => op_result_ok(format!("Installed {name}. Android confirmed installation.")),
                 Err(error) => op_result_err(error),
             };
         }
         if let Err(error) = scope::ensure_legacy(&runtime_id) { return op_result_err(error); }
-        match apps::install(std::path::Path::new(&path)) {
+        match apps::install_set(set) {
             Ok(info) => op_result_ok(format!(
-                "Installed {} — version {} (code {}). Verified in Android.",
-                info.package,
+                "Installed {name} — version {} (code {}). Verified in Android.",
                 info.version_name.unwrap_or_else(|| "unknown".into()),
                 info.version_code.unwrap_or_default()
             )),
@@ -951,6 +1006,21 @@ async fn install_apk(
         }
     })
     .await)
+}
+
+/// The dialog is done: remove the unpacked files of its selection.
+#[tauri::command]
+async fn discard_apk_install(plan: u64, plans: State<'_, ApkPlans>) -> Result<(), ()> {
+    let plans = plans.0.clone();
+    blocking(move || {
+        let discarded = {
+            let mut plans = plans.lock().unwrap_or_else(|e| e.into_inner());
+            if plans.0 == plan { plans.1.take() } else { None }
+        };
+        // An install still running keeps its files until it returns.
+        drop(discarded);
+    }).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1143,6 +1213,16 @@ fn login_start() -> i32 {
     1
 }
 
+/// A menu or file-manager launch has no terminal; surface the failure on desktop.
+fn desktop_failure(summary: &str, message: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=AnvilDroid", "--", summary, message])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn main() {
     let _ = STARTUP_TRACE.set(std::env::var_os("ANVILDROID_STARTUP_TRACE")
         .filter(|value| value == "1").map(|_| std::time::Instant::now()));
@@ -1162,7 +1242,23 @@ fn main() {
     let open_settings = raw_args.len() == 1 && raw_args[0] == "--settings";
     let open_controls = raw_args.len() == 1 && raw_args[0] == "--controls";
     let autostart = raw_args.len() == 1 && raw_args[0] == "--autostart";
-    if !raw_args.is_empty() && !open_settings && !open_controls && !autostart {
+    // A file manager opens package files as `anvildroid-gui FILE.apk FILE.xapk ...`.
+    let open_apk = if !raw_args.is_empty() && raw_args.len() <= open_file::MAX_FILES
+        && raw_args.iter().all(|argument| open_file::is_apk_argument(argument)) {
+        match raw_args.iter().map(|argument| open_file::resolve(argument)).collect::<Result<Vec<_>, _>>() {
+            // A running AnvilDroid window opens the files; otherwise this one does.
+            Ok(paths) if open_file::forward(&paths) => return,
+            Ok(paths) => paths,
+            Err(message) => {
+                eprintln!("{message}");
+                desktop_failure("Cannot open package file", &message);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !raw_args.is_empty() && !open_settings && !open_controls && !autostart && open_apk.is_empty() {
         let result = (|| -> Result<String, AnvilError> {
             let (runtime_id, args) = scope::parse_selector(&raw_args)?;
             let args: Vec<String> = args
@@ -1174,7 +1270,7 @@ fn main() {
                 .collect::<Result<_, _>>()?;
             if args.len() != 2 || !backend::valid_package(&args[1]) {
                 Err(AnvilError::InvalidArgument(
-                "Usage: anvildroid-gui [--runtime ID] [--launch-app|--app-info|--create-shortcut PACKAGE]".into(),
+                "Usage: anvildroid-gui [FILE.apk|.apks|.xapk|.apkm ...] | [--runtime ID] [--launch-app|--app-info|--create-shortcut PACKAGE]".into(),
             ))
             } else if library::valid_managed_runtime(&runtime_id) {
                 match args[0].as_str() {
@@ -1214,18 +1310,7 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("{}: {e}", e.code());
-                // A menu launch has no terminal; surface the failure on desktop.
-                let _ = std::process::Command::new("notify-send")
-                    .args([
-                        "--app-name=AnvilDroid",
-                        "--",
-                        "AnvilDroid action failed",
-                        &e.to_string(),
-                    ])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                desktop_failure("AnvilDroid action failed", &e.to_string());
                 std::process::exit(1);
             }
         }
@@ -1241,7 +1326,9 @@ fn main() {
         context.config_mut().app.windows[0].url =
             tauri::WebviewUrl::App("index.html?view=controls".into());
     }
+    let opens_apk = !open_apk.is_empty();
     tauri::Builder::default()
+        .manage(open_file::PendingApk(Mutex::new(open_apk)))
         .append_invoke_initialization_script(if matches!(STARTUP_TRACE.get(), Some(Some(_))) {
             "document.addEventListener('DOMContentLoaded', () => { window.__TAURI__.core.invoke('startup_ready', {resources:performance.getEntriesByType('resource').slice(0,30).map(r=>({name:r.name.split('/').pop().slice(0,240),start:Math.round(r.startTime),duration:Math.round(r.duration)}))}); requestAnimationFrame(() => requestAnimationFrame(() => window.__TAURI__.core.invoke('startup_ready'))); }, {once:true});"
         } else { "" })
@@ -1257,13 +1344,16 @@ fn main() {
             app.manage(anvildroid_core::shortcut_preferences::ShortcutMonitor::start()?);
             #[cfg(target_os = "linux")]
             titlebar::install(app)?;
-            preferences::show_at_startup(app.handle(), open_settings || open_controls)?;
+            // The controls window is a separate tool; the main GUI takes APK files.
+            if !open_controls { open_file::listen(app.handle().clone()); }
+            preferences::show_at_startup(app.handle(), open_settings || open_controls || opens_apk)?;
             startup_mark("window-visibility-configured");
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(preferences::handle_close)
         .manage(OpGuard(Arc::new(Mutex::new(()))))
+        .manage(ApkPlans::default())
         .register_asynchronous_uri_scheme_protocol("appicon", |_ctx, request, responder| {
             let path = percent_decode(request.uri().path());
             if let Some(package) = icon_package(&path) {
@@ -1303,6 +1393,7 @@ fn main() {
             runtime_controller,
             export_runtime_diagnostics,
             export_keymap_scheme,
+            save_device_screenshot,
             adb_host_status,
             adb_host_action,
             start_runtime_controller,
@@ -1327,7 +1418,11 @@ fn main() {
             remove_app_shortcut,
             get_shortcut_preferences,
             set_automatic_shortcuts,
-            install_apk,
+            prepare_apk_install,
+            install_prepared_apk,
+            discard_apk_install,
+            open_file::take_pending_apk,
+            device_log::save_device_log,
             import_runtime_image,
             import_runtime_image_folder,
             import_runtime_image_url,
