@@ -75,6 +75,7 @@ if [ "\$1" -eq 0 ] && [ -d /run/systemd/system ]; then systemctl disable --now a
 %{_bindir}/anvildroid-gui
 %{_datadir}/doc/anvildroid-controller
 %{_datadir}/applications/org.anvildroid.gui.desktop
+%{_datadir}/mime/packages/org.anvildroid.gui.xml
 %{_datadir}/icons/hicolor/*/apps/org.anvildroid.gui.png
 %{_prefix}/local/lib/anvildroid-controller
 /usr/lib/systemd/system/anvildroid-controller.service

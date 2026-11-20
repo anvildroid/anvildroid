@@ -86,6 +86,11 @@ release.
    then **Create and start**. The first start takes a few minutes while the
    image is prepared.
 3. **Install APK** or open an app. Each app gets its own desktop window.
+   Choose one or several files: `.apk` files, split APKs (select the base
+   APK together with its splits) and `.apks`, `.xapk` or `.apkm` bundles.
+   Dropping files on the AnvilDroid window, or opening them from the file
+   manager with AnvilDroid, shows the same dialog with those files selected.
+   Expansion files (OBB) inside an `.xapk` are not installed.
 
 Prefer to do it by hand? **Devices → Android images** downloads or imports an
 image, then **Devices → + New device** creates a device from it.
@@ -117,6 +122,9 @@ devices, images, device settings, game controls, ADB, themes and updates.
 - ARM translation (libndk_translation, libhoudini), device identity profiles,
   Google Play registration help
 - ADB for Android Studio, diagnostics export
+- Device tools for a running device: Android log viewer, screenshots, HTTP
+  proxy and Private DNS, live per-app CPU, memory and frame rate
+- Backups of a device's Android data, restored in place
 - HUD and Classic themes, light or dark, six accent colours
 
 ## Known limitations

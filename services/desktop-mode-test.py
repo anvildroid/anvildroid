@@ -98,5 +98,45 @@ class DesktopStore(unittest.TestCase):
                 store.close()
 
 
+
+class WindowModeAtStart(unittest.TestCase):
+    """Android's saved persist.* value must not decide the window mode."""
+    def setUp(self):
+        self.linux = controller.worker_module.linux
+        self.source = Path(__file__).parent
+
+    def test_init_block_is_added_once_and_follows_the_chosen_mode(self):
+        base = 'service composer /bin/composer\n    class hal\n'
+        on = self.linux.window_mode_init(base, True)
+        self.assertTrue(on.startswith(base))
+        self.assertTrue(on.endswith('\n# AnvilDroid window mode\non load_persist_props_action\n'
+                                    '    setprop persist.waydroid.multi_windows true\n'))
+        self.assertEqual(self.linux.window_mode_init(on, True), on)
+        off = self.linux.window_mode_init(on, False)
+        self.assertEqual(off.count('persist.waydroid.multi_windows'), 1)
+        self.assertTrue(off.endswith('    setprop persist.waydroid.multi_windows false\n'))
+        self.assertTrue(off.startswith(base))
+
+    def test_block_starts_a_new_init_section_after_the_last_service(self):
+        text = self.linux.window_mode_init('service last /bin/x\n    setenv A b', True)
+        self.assertIn('    setenv A b\n\n# AnvilDroid window mode\non load_persist_props_action\n', text)
+
+    def test_managed_devices_apply_the_mode_of_this_start(self):
+        worker = (self.source / 'runtime-worker.py').read_text()
+        decided = worker.index('multi_windows = not (single_display or')
+        self.assertLess(decided, worker.index('linux.window_mode_init(config_text, multi_windows)'))
+        self.assertLess(worker.index('linux.window_mode_init(config_text, multi_windows)'),
+                        worker.index('init.write_text(config_text)'))
+
+    def test_system_waydroid_bridge_always_starts_with_app_windows(self):
+        existing = (self.source / 'runtime-existing.py').read_text()
+        body = existing[existing.index('    def keymap_init(text):'):existing.index('    def ensure_keymap_receiver')]
+        self.assertIn('linux.window_mode_init(text, True)', body)
+        system = (self.source / 'runtime-system.py').read_text()
+        hook = system[system.index('    def props(self, args, session, path):'):]
+        self.assertIn("props = [p for p in props if not p.startswith('persist.waydroid.multi_windows=')]", hook)
+        self.assertIn("props.append('persist.waydroid.multi_windows=true')", hook)
+        self.assertNotIn("if not any(p.startswith('persist.waydroid.multi_windows=')", hook)
+
 if __name__ == '__main__':
     unittest.main()

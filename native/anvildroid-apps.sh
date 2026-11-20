@@ -36,9 +36,77 @@ while true; do
             esac
             case "$action" in
                 details) dumpsys package "$package" ;;
+                installs)
+                    # Asked before an install is queued: does the package service
+                    # answer, and which install sessions is Android working on.
+                    pm path android
+                    dumpsys package installs | head -c 262144 ;;
                 install)
-                    [ -f input.apk ] && [ ! -L input.apk ] || exit 2
-                    pm install -r --user 0 "$base/$work/input.apk" ;;
+                    if [ -e count ] || [ -L count ] || [ -e input-0.apk ] || [ -L input-0.apk ]; then
+                        # Split package: the host writes how many APKs it staged as
+                        # input-0.apk (base), input-1.apk, ... for one install session.
+                        # Exactly that set must be there: a missing, extra or linked
+                        # file would otherwise install a different package than asked.
+                        [ -f count ] && [ ! -L count ] || { echo 'Split package without its APK count'; exit 2; }
+                        read -r count < count
+                        case "$count" in
+                            ''|*[!0-9]*|0*|?????*) echo 'Invalid split APK count'; exit 2;;
+                        esac
+                        [ "$count" -ge 2 ] && [ "$count" -le 512 ] || { echo 'Invalid split APK count'; exit 2; }
+                        index=0
+                        while [ "$index" -lt "$count" ]; do
+                            [ -f "input-$index.apk" ] && [ ! -L "input-$index.apk" ] || {
+                                echo "Split APK $index is missing or is not a regular file; nothing was installed"; exit 2; }
+                            index=$((index + 1))
+                        done
+                        found=0
+                        for extra in input*.apk; do
+                            [ -e "$extra" ] || [ -L "$extra" ] || continue
+                            found=$((found + 1))
+                        done
+                        [ "$found" -eq "$count" ] || { echo 'Unexpected APK files in the request; nothing was installed'; exit 2; }
+                        created=$(timeout 30 pm install-create -r --user 0)
+                        result=$?
+                        session=${created##*\[}
+                        session=${session%%\]*}
+                        case "$session" in
+                            ''|*[!0-9]*) printf '%s\n' "$created"
+                                echo 'Android did not open an install session; nothing was installed'; exit 1;;
+                        esac
+                        if [ "$result" -ne 0 ]; then
+                            printf '%s\n' "$created"
+                            timeout 15 pm install-abandon "$session" > /dev/null 2>&1
+                            echo 'Android did not open an install session; nothing was installed'
+                            exit 1
+                        fi
+                        index=0
+                        while [ "$index" -lt "$count" ]; do
+                            # Fixed text, no request data in it. The file is opened once;
+                            # its type, size and content all come from that descriptor,
+                            # and the whole step is bounded so a pipe cannot stall the queue.
+                            if ! written=$(timeout 150 sh -c 'exec < "$3" || exit 1
+                                    [ -f /proc/self/fd/0 ] || { echo "Not a regular file"; exit 1; }
+                                    size=$(stat -L -c %s /proc/self/fd/0) || exit 1
+                                    exec pm install-write -S "$size" "$1" "$2"' sh "$session" "$index.apk" "input-$index.apk"); then
+                                printf '%s\n' "$written"
+                                timeout 15 pm install-abandon "$session" > /dev/null 2>&1
+                                echo 'Android rejected a split APK; nothing was installed'
+                                exit 1
+                            fi
+                            index=$((index + 1))
+                        done
+                        # No abandon after this point: a commit may still complete.
+                        timeout 900 pm install-commit "$session"
+                        result=$?
+                    else
+                        [ -f input.apk ] && [ ! -L input.apk ] || { echo 'No APK in request'; exit 2; }
+                        timeout 900 pm install -r --user 0 "$base/$work/input.apk"
+                        result=$?
+                    fi
+                    if [ "$result" -eq 124 ] || [ "$result" -eq 137 ]; then
+                        echo 'Android did not confirm the installation in time; it may still complete. Refresh before retrying.'
+                    fi
+                    [ "$result" -eq 0 ] || exit 1 ;;
                 force-stop)
                     case "$package" in
                         android|com.android.*|org.lineageos.*|org.anvildroid.*|id.waydro.*)

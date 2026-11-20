@@ -14,7 +14,7 @@ REQUIRED = (
     'AppRun', 'AppRun.wrapped', 'usr/bin/anvildroid-gui', 'usr/bin/anvildroid',
     'scripts/bootstrap-appimage.py', 'scripts/start-runtime-controller.py', 'scripts/setup-waydroid.py',
     'scripts/install-runtime-controller.py', 'scripts/apk-align.py', 'services/runtime-host.py',
-    'services/runtime-features.py', 'services/runtime-compatibility.py', 'services/runtime-shares.py', 'services/runtime-default-shares.py', 'services/runtime-device.py', 'services/runtime-components.py', 'services/runtime-diagnostics.py', 'services/runtime-notifications.py', 'services/runtime-camera.py', 'services/notification-relay.py',
+    'services/runtime-features.py', 'services/runtime-compatibility.py', 'services/runtime-shares.py', 'services/runtime-default-shares.py', 'services/runtime-device.py', 'services/runtime-components.py', 'services/runtime-diagnostics.py', 'services/runtime-notifications.py', 'services/runtime-camera.py', 'services/runtime-backup.py', 'services/runtime-inspect.py', 'services/runtime-logs.py', 'services/runtime-capture.py', 'services/runtime-proxy.py', 'services/runtime-performance.py', 'services/notification-relay.py',
     'target/native/libanvildroid-path-guard.so', 'target/native/libanvildroid-runtime-window.so', 'target/native/libanvildroid-window.so',
     'target/native/overlay-key.p12', 'target/ime/AnvilDroidIme.apk',
     'target/shutdown/anvildroid-shutdown.jar', 'native/overlay/AndroidManifest.xml',

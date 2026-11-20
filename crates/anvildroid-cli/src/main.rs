@@ -20,8 +20,9 @@ Usage: anvildroid COMMAND [--json]
   window-mode MODE       Set desktop or immersive Android window mode
   runtimes [--json]      Show registered runtime and configured settings
   apps                   List installed apps
-  install FILE.apk       Install an existing APK
+  install FILE...        Install APKs, split APKs or bundles (.apks, .xapk, .apkm)
   run PACKAGE            Launch an installed package
+  screenshot FILE.png    Save a picture of the running Android display to a new file
   log                    Show/follow backend logs
   gpu [vulkan|gles]      Show or set container GPU mode (restart to apply)
 
@@ -82,15 +83,17 @@ fn run() -> Result<u8, String> {
                 return Ok(0);
             }
             "install" => {
-                if args.len() != 2 || json {
+                if args.len() < 2 || json {
                     return report(Err(managed_cli::Failure { code: managed_cli::USAGE,
-                        message: "Usage: anvildroid --runtime ID install FILE.apk".into() }));
+                        message: "Usage: anvildroid --runtime ID install FILE.apk [FILE ...]".into() }));
                 }
-                anvildroid_core::managed::install(&runtime_id, std::path::Path::new(&args[1]))
-                    .map_err(|e| e.to_string())?;
-                println!("Installed into {runtime_id}; Android confirmed installation.");
-                return Ok(0);
+                return install_files(&args[1..], |set| {
+                    anvildroid_core::managed::install_set(&runtime_id, set)?;
+                    Ok(format!("Installed {} into {runtime_id}; Android confirmed installation.",
+                        anvildroid_core::apk_set::describe(set)))
+                });
             }
+            "screenshot" => return screenshot(&runtime_id, &args, json, "anvildroid --runtime ID screenshot FILE.png"),
             _ => return report(managed_cli::run(&mut managed_cli::Live, &runtime_id, &raw_args)),
         }
     }
@@ -202,15 +205,16 @@ fn run() -> Result<u8, String> {
             }
         }
         "install" => {
-            backend::backend_args(&args).map_err(|e| e.to_string())?;
-            let info = anvildroid_core::apps::install(std::path::Path::new(&args[1]))
-                .map_err(|e| e.to_string())?;
-            println!(
-                "Installed {} version {:?}; verified in Android.",
-                info.package, info.version_code
-            );
-            Ok(0)
+            if args.len() < 2 {
+                return Err("Usage: anvildroid install FILE.apk [FILE ...]".into());
+            }
+            install_files(&args[1..], |set| {
+                let info = anvildroid_core::apps::install_set(set)?;
+                let version = info.version_code.map(|code| format!(" version {code}")).unwrap_or_default();
+                Ok(format!("Installed {}{version}; verified in Android.", info.package))
+            })
         }
+        "screenshot" => screenshot(&runtime_id, &args, json, "anvildroid screenshot FILE.png"),
         "run" => {
             let forwarded = backend::backend_args(&args).map_err(|e| e.to_string())?;
             runtime::launch_preflight().map_err(|e| e.to_string())?;
@@ -243,6 +247,48 @@ fn run() -> Result<u8, String> {
         }
         _ => forward_to_backend(&args),
     }
+}
+
+/// Install APKs, split APKs and bundles: the files of one package go to
+/// Android as one install session, packages one after another.
+fn install_files(
+    files: &[OsString],
+    mut install: impl FnMut(&anvildroid_core::apk_set::PackageSet) -> Result<String, anvildroid_core::error::AnvilError>,
+) -> Result<u8, String> {
+    use anvildroid_core::apk_set;
+    let paths: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+    let prepared = apk_set::prepare(&paths).map_err(|e| e.to_string())?;
+    let mut failed = false;
+    for rejected in &prepared.rejected {
+        eprintln!("anvildroid: not installed: {}: {}", rejected.file, rejected.reason);
+        failed = true;
+    }
+    for set in &prepared.packages {
+        match install(set) {
+            Ok(message) => {
+                println!("{message}");
+                if let Some(notice) = apk_set::obb_notice(set) {
+                    eprintln!("anvildroid: note: {notice}");
+                }
+            }
+            Err(error) => {
+                eprintln!("anvildroid: not installed: {}: {error}", apk_set::describe(set));
+                failed = true;
+            }
+        }
+    }
+    Ok(u8::from(failed))
+}
+
+/// Save a PNG of the whole Android display. An existing file is never replaced.
+fn screenshot(id: &str, args: &[OsString], json: bool, usage: &str) -> Result<u8, String> {
+    if args.len() != 2 || json {
+        return report(Err(managed_cli::Failure { code: managed_cli::USAGE, message: format!("Usage: {usage}") }));
+    }
+    let path = env::current_dir().map_err(|e| e.to_string())?.join(&args[1]);
+    let saved = anvildroid_core::controller::screenshot_to(id, &path, false)?;
+    println!("Saved {} x {} screenshot to {}", saved["width"], saved["height"], path.display());
+    Ok(0)
 }
 
 fn forward_to_backend(args: &[OsString]) -> Result<u8, String> {

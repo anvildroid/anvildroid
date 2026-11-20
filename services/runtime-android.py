@@ -169,7 +169,7 @@ class AndroidBackend:
         identity = json.loads(identity_path.read_text()) if identity_path.exists() else None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(330 if operation == 'install' else (90 if operation == 'compatibility' else 45 if operation == 'app_action' else 20 if operation == 'keymap_scheme' else 8))
+                connection.settimeout(330 if operation == 'install' else 30 if operation == 'inspect' else (90 if operation == 'compatibility' else 45 if operation == 'app_action' else 20 if operation == 'keymap_scheme' else 8))
                 connection.connect(str(instance / 'worker.sock'))
                 _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                 if uid != 0: raise RuntimeError('Untrusted runtime worker')
@@ -180,7 +180,7 @@ class AndroidBackend:
                 data = bytearray()
                 while not data.endswith(b'\n'):
                     part = connection.recv(4096)
-                    if not part or len(data) > (1024 * 1024 if operation in ('apps','keymaps','keymap_scheme') else 8192): raise RuntimeError('Invalid worker response')
+                    if not part or len(data) > (1024 * 1024 if operation in ('apps','keymaps','keymap_scheme','inspect') else 8192): raise RuntimeError('Invalid worker response')
                     data.extend(part)
                 report = json.loads(data)
         except (FileNotFoundError, ConnectionRefusedError):
@@ -293,18 +293,29 @@ class AndroidBackend:
                 'gsf_id_error': id_error,
                 'checked_at': int(time.time())}
 
-    def install(self, identifier, fd):
+    def install(self, identifier, fd, parts=None):
         status = self.status(identifier)
         if status['state'] not in ('Running', 'Frozen'): raise RuntimeError('Start this runtime before installing an APK')
         if 'install_apk' not in status.get('capabilities', []):
             raise RuntimeError('Stop and start this runtime once to load APK installation support, then retry.')
-        report = self.status(identifier, 'install', {'op': 'install', 'generation': status['generation']}, apk_fd=fd)
+        payload = {'op': 'install', 'generation': status['generation']}
+        if parts is not None:
+            # A worker started before split support would install only the first APK.
+            if 'install_splits' not in status.get('capabilities', []):
+                raise RuntimeError('Stop and start this device once to load split package support, then retry.')
+            payload['parts'] = parts
+        try:
+            report = self.status(identifier, 'install', payload, apk_fd=fd)
+        except OSError as error:
+            # The worker did not answer in time or the connection broke after the
+            # file was handed over: Android may still be committing the install.
+            raise RuntimeError('Android did not confirm installation in time. It may still be installing the app. Check the Android window and the installed app list before retrying; the installation outcome is unknown.') from error
         if report.get('app_error'): raise RuntimeError(report['app_error'])
         if report.get('generation') != status['generation'] or report['state'] != 'Running':
-            raise RuntimeError('Worker changed during installation; outcome unknown. Check before retrying.')
+            raise RuntimeError('Worker changed during installation; the installation outcome is unknown. Check before retrying.')
         result = report.get('app_result')
         if not isinstance(result, dict) or result.get('action') != 'install' or result.get('success') is not True:
-            raise RuntimeError('Invalid installation result; outcome unknown')
+            raise RuntimeError('Invalid installation result; the installation outcome is unknown. Check before retrying.')
         return result
 
     def app_action(self, identifier, action, package, activation_token=None, user=0):

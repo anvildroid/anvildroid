@@ -166,6 +166,7 @@ class StandaloneSupportTests(unittest.TestCase):
              patch.object(support, 'LXC_TEMPLATE_DIRS', (self.templates,)), \
              patch.object(controller.shutil, 'which', return_value='/usr/bin/tool'), \
              patch.object(controller.host_module, 'missing_commands', return_value=[]), \
+             patch.object(controller.host_module, 'inotify_check', return_value={'id': 'inotify', 'label': 'File watches', 'available': True, 'detail': 'Available'}), \
              patch.object(controller.desktop_module, 'capabilities', return_value={'desktop': True, 'detail': 'Ready'}):
             report = controller.Store.requirements(store)
         self.assertTrue(report['can_start'])

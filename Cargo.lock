@@ -55,6 +55,7 @@ version = "0.1.13"
 dependencies = [
  "base64 0.22.1",
  "dirs",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
@@ -67,6 +68,7 @@ dependencies = [
  "anvildroid-core",
  "cc",
  "gtk",
+ "libc",
  "libloading",
  "serde",
  "serde_json",

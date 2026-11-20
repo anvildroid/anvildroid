@@ -47,6 +47,42 @@ pub enum Request {
     CameraGet { id: String },
     #[serde(rename = "camera_set")]
     CameraSet { id: String, enabled: bool, devices: Vec<String> },
+    /// Backups of a device's Android data. Archives are named by ID only:
+    /// the controller chooses every path.
+    #[serde(rename = "backups_get")]
+    BackupsGet { id: String },
+    #[serde(rename = "backup_create")]
+    BackupCreate { id: String },
+    #[serde(rename = "backup_restore")]
+    BackupRestore { id: String, backup_id: String, allow_image_mismatch: bool },
+    #[serde(rename = "backup_delete")]
+    BackupDelete { id: String, backup_id: String },
+    #[serde(rename = "backup_cancel")]
+    BackupCancel { id: String },
+    /// Raw process counters, the app in front and its frame counters of a
+    /// running device. Takes no arguments: Android names the app itself.
+    #[serde(rename = "performance_get")]
+    PerformanceGet { id: String },
+    /// HTTP proxy and Private DNS of a running device, kept in Android's own
+    /// settings. An empty `proxy_host` with port 0 and no bypass means no proxy.
+    #[serde(rename = "network_get")]
+    NetworkGet { id: String },
+    #[serde(rename = "network_set")]
+    NetworkSet {
+        id: String,
+        proxy_host: String,
+        proxy_port: u16,
+        proxy_bypass: Vec<String>,
+        dns_mode: String,
+        dns_hostname: String,
+    },
+    /// Recent Android log lines. `since` is the cursor of the previous answer.
+    #[serde(rename = "logs_get")]
+    LogsGet { id: String, lines: u32, level: String, package: Option<String>, since: Option<String> },
+    /// PNG of the whole Android display, written to the one descriptor sent
+    /// with the request (see `screenshot`). Never carries a path.
+    #[serde(rename = "screenshot_save")]
+    ScreenshotSave { id: String },
     #[serde(rename = "adb_info")]
     AdbInfo { id: String },
     #[serde(rename = "adb_set")]
@@ -75,6 +111,9 @@ pub enum Request {
     },
     Install {
         id: String,
+        /// Sizes of the APKs of one split package, laid end to end in the file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parts: Option<Vec<u64>>,
     },
     #[serde(rename = "display_info")]
     DisplayInfo {
@@ -401,7 +440,28 @@ pub fn install(id: &str, path: &std::path::Path) -> Result<Value, String> {
     }
     let socket = UnixStream::connect("/run/anvildroid/control.sock")
         .map_err(|e| format!("Runtime controller unavailable: {e}"))?;
-    exchange_file(socket, Request::Install { id: id.into() }, Some(&file))
+    exchange_file(socket, Request::Install { id: id.into(), parts: None }, Some(&file))
+}
+
+/// Install one package from a caller-opened file that holds its APKs end to
+/// end. `sizes` marks where each APK ends; several APKs form one session.
+pub fn install_parts(id: &str, file: &std::fs::File, sizes: &[u64]) -> Result<Value, String> {
+    if !crate::library::valid_managed_runtime(id) {
+        return Err("Invalid runtime ID".into());
+    }
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let total = sizes.iter().try_fold(0u64, |total, size| total.checked_add(*size));
+    if !metadata.is_file() || sizes.is_empty() || sizes.len() > crate::apk_set::MAX_PARTS
+        || sizes.iter().any(|size| *size == 0 || *size > crate::apk_set::MAX_APK)
+        || total != Some(metadata.len()) || metadata.len() > crate::apk_set::MAX_SET
+    {
+        return Err("A package may hold up to 512 APKs of at most 2 GiB each and 4 GiB in total".into());
+    }
+    let socket = UnixStream::connect("/run/anvildroid/control.sock")
+        .map_err(|e| format!("Runtime controller unavailable: {e}"))?;
+    // One APK keeps the request every controller and worker version accepts.
+    let parts = (sizes.len() > 1).then(|| sizes.to_vec());
+    exchange_file(socket, Request::Install { id: id.into(), parts }, Some(file))
 }
 
 pub fn import_image(path: &std::path::Path, name: &str) -> Result<Value, String> {
@@ -463,6 +523,81 @@ pub fn import_arm_source(kind: &str, source: &str, expected_sha256: &str) -> Res
     exchange_file(socket, Request::ArmImport {}, Some(&file))
 }
 
+/// Capture the whole Android display of a running device as PNG into a file
+/// the caller opened for writing. Only the descriptor reaches the root
+/// controller, which checks the image before it writes anything.
+pub fn screenshot(id: &str, file: &std::fs::File) -> Result<Value, String> {
+    if id != crate::scope::LEGACY_ID && !crate::library::valid_managed_runtime(id) {
+        return Err("Invalid runtime ID".into());
+    }
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("The screenshot destination must be a regular file".into());
+    }
+    let socket = UnixStream::connect("/run/anvildroid/control.sock")
+        .map_err(|e| format!("Runtime controller unavailable: {e}"))?;
+    exchange_file(socket, Request::ScreenshotSave { id: id.into() }, Some(file))
+}
+
+/// Save a screenshot of `id` at `path`. With `overwrite` an existing file is
+/// replaced (the caller already asked the user); without it the file must be new.
+pub fn screenshot_to(id: &str, path: &std::path::Path, overwrite: bool) -> Result<Value, String> {
+    let mut result = save_screenshot(path, overwrite, |file| screenshot(id, file))?;
+    if result["runtime_id"].as_str() != Some(id) {
+        // Already published under the chosen name: do not leave another device's picture there.
+        let _ = std::fs::remove_file(path);
+        return Err("The screenshot came from another device; nothing was saved. Try again.".into());
+    }
+    result["path"] = path.to_string_lossy().into();
+    Ok(result)
+}
+
+/// The picture is written to a new hidden file next to the target and only a
+/// complete one gets the chosen name, so a failed capture leaves nothing behind
+/// and never damages an existing file.
+fn save_screenshot(
+    path: &std::path::Path,
+    overwrite: bool,
+    capture: impl FnOnce(&std::fs::File) -> Result<Value, String>,
+) -> Result<Value, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or("Choose a file name for the screenshot")?;
+    let folder = path.parent().filter(|folder| !folder.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let exists = || format!("{} already exists. Choose another file name.", path.display());
+    match path.symlink_metadata() {
+        Ok(found) if found.is_dir() => return Err(format!("{} is a folder. Choose a file name.", path.display())),
+        Ok(_) if !overwrite => return Err(exists()),
+        _ => {}
+    }
+    let (file, temporary) = (0..16).find_map(|attempt| {
+        let temporary = folder.join(format!(".{name}.{}-{attempt}.part", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&temporary) {
+            Ok(file) => Some(Ok((file, temporary))),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(error) => Some(Err(format!("Cannot create a file in {}: {error}", folder.display()))),
+        }
+    }).unwrap_or_else(|| Err(format!("Cannot create a temporary file in {}", folder.display())))?;
+    let temporary = Remove(temporary);
+    let result = capture(&file)?;
+    let written = file.metadata().map_err(|e| e.to_string())?.len();
+    if written == 0 || result["bytes"].as_u64() != Some(written) {
+        return Err("The screenshot was not written completely; nothing was saved. Try again.".into());
+    }
+    if overwrite {
+        std::fs::rename(&temporary.0, path).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    } else if let Err(error) = std::fs::hard_link(&temporary.0, path) {
+        // A link never replaces a file. Filesystems without links fall back to a rename.
+        if error.kind() == std::io::ErrorKind::AlreadyExists || path.symlink_metadata().is_ok() {
+            return Err(exists());
+        }
+        std::fs::rename(&temporary.0, path).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    }
+    Ok(result)
+}
+
 fn exchange_file(socket: UnixStream, request: Request, file: Option<&std::fs::File>) -> Result<Value, String> {
     let files: Vec<_> = file.into_iter().collect();
     exchange_files(socket, request, &files)
@@ -511,6 +646,14 @@ fn exchange_files(
         // System Waydroid reinstalls synchronously: image extraction and the
         // verified ARM package must finish before reporting completion.
         600
+    } else if matches!(&request, Request::ScreenshotSave { .. }) {
+        // Capture (15 s) plus the bounded copy to a possibly slow destination.
+        45
+    } else if matches!(&request, Request::NetworkSet { .. } | Request::LogsGet { .. }) {
+        // Several `settings` calls, or `ps` plus `logcat`, on a busy device.
+        20
+    } else if matches!(&request, Request::PerformanceGet { .. } | Request::NetworkGet { .. }) {
+        10
     } else {
         5
     };
@@ -686,6 +829,36 @@ mod tests {
     }
 
     #[test]
+    fn backup_requests_round_trip_and_never_carry_a_path() {
+        let backup = "0123456789abcdef0123456789abcdef";
+        for value in [
+            serde_json::json!({"op":"backups_get","id":"default"}),
+            serde_json::json!({"op":"backup_create","id":"r-11111111111111111111111111111111"}),
+            serde_json::json!({"op":"backup_restore","id":"default","backup_id":backup,"allow_image_mismatch":false}),
+            serde_json::json!({"op":"backup_delete","id":"r-11111111111111111111111111111111","backup_id":backup}),
+            serde_json::json!({"op":"backup_cancel","id":"default"}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+            for (key, privileged) in [("path", serde_json::json!("/etc")), ("destination", serde_json::json!("/tmp/x")),
+                                      ("uid", serde_json::json!(0)), ("owner_uid", serde_json::json!(0))] {
+                let mut invalid = value.clone();
+                invalid[key] = privileged;
+                assert!(serde_json::from_value::<Request>(invalid).is_err());
+            }
+        }
+        for invalid in [
+            serde_json::json!({"op":"backup_restore","id":"default","backup_id":backup}),
+            serde_json::json!({"op":"backup_restore","id":"default","backup_id":backup,"allow_image_mismatch":"yes"}),
+            serde_json::json!({"op":"backup_restore","id":"default","allow_image_mismatch":true}),
+            serde_json::json!({"op":"backup_delete","id":"default"}),
+            serde_json::json!({"op":"backup_create"}),
+        ] {
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn data_location_requests_round_trip_exactly() {
         for value in [
             serde_json::json!({"op":"data_location"}),
@@ -739,6 +912,25 @@ mod tests {
         let request: Request = serde_json::from_str(r#"{"op":"app_states","id":"r-test"}"#).unwrap();
         assert!(matches!(request, Request::AppStates { ref id } if id == "r-test"));
         assert!(serde_json::from_str::<Request>(r#"{"op":"app_states","id":"r-test","uid":0}"#).is_err());
+    }
+    #[test]
+    fn install_request_carries_split_sizes_and_never_a_path() {
+        let single = Request::Install { id: "r-test".into(), parts: None };
+        assert_eq!(serde_json::to_string(&single).unwrap(), r#"{"op":"install","id":"r-test"}"#);
+        let split = Request::Install { id: "r-test".into(), parts: Some(vec![11, 7]) };
+        assert_eq!(serde_json::to_string(&split).unwrap(), r#"{"op":"install","id":"r-test","parts":[11,7]}"#);
+        assert!(serde_json::from_str::<Request>(r#"{"op":"install","id":"r-test","parts":[1],"path":"/x.apk"}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"op":"install","id":"r-test","parts":["1"]}"#).is_err());
+        // Sizes that do not describe the open file are refused before any request.
+        let path = std::env::temp_dir().join(format!("anvil-parts-{}.bin", std::process::id()));
+        std::fs::write(&path, b"PK\x03\x04onePK\x03\x04two").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let id = "r-11111111111111111111111111111111";
+        for sizes in [&[][..], &[7, 6], &[7, 0, 7], &[15]] {
+            assert!(install_parts(id, &file, sizes).unwrap_err().contains("up to 512 APKs"), "{sizes:?}");
+        }
+        assert_eq!(install_parts("default", &file, &[7, 7]).unwrap_err(), "Invalid runtime ID");
     }
     #[test]
     fn apk_descriptor_transfer_preserves_bytes_without_sending_a_path() {
@@ -868,6 +1060,96 @@ mod tests {
         }
     }
     #[test]
+    fn screenshot_request_carries_only_the_device_and_one_descriptor() {
+        for id in ["default", "r-11111111111111111111111111111111"] {
+            let wire = serde_json::json!({"op":"screenshot_save","id":id});
+            let request: Request = serde_json::from_value(wire.clone()).unwrap();
+            assert!(matches!(request, Request::ScreenshotSave { id: ref sent } if sent == id));
+            assert_eq!(serde_json::to_value(request).unwrap(), wire);
+            for (key, privileged) in [("path", serde_json::json!("/etc/x.png")), ("destination", serde_json::json!("/tmp/x")),
+                                      ("uid", serde_json::json!(0)), ("display", serde_json::json!(1))] {
+                let mut invalid = wire.clone();
+                invalid[key] = privileged;
+                assert!(serde_json::from_value::<Request>(invalid).is_err());
+            }
+        }
+        assert!(serde_json::from_str::<Request>(r#"{"op":"screenshot_save"}"#).is_err());
+        let folder = std::env::temp_dir().join(format!("anvil-shot-{}", std::process::id()));
+        std::fs::create_dir(&folder).unwrap();
+        let directory = std::fs::File::open(&folder).unwrap();
+        assert_eq!(screenshot("r-1", &directory).unwrap_err(), "Invalid runtime ID");
+        assert!(screenshot("default", &directory).unwrap_err().contains("regular file"));
+
+        // The descriptor travels with the request; the receiver writes through it.
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::FileExt;
+        let sent_path = folder.join("sent.png");
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&sent_path).unwrap();
+        let mut payload = serde_json::to_vec(&Request::ScreenshotSave { id: "default".into() }).unwrap();
+        payload.push(b'\n');
+        let (mut client, server) = UnixStream::pair().unwrap();
+        send_files(&mut client, &payload, &[&file]).unwrap();
+        let mut bytes = [0u8; 100];
+        let mut control = [0usize; 16];
+        let mut iov = libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        let received = unsafe { libc::recvmsg(server.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        assert_eq!(&bytes[..received as usize], b"{\"op\":\"screenshot_save\",\"id\":\"default\"}\n");
+        let fd = unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            assert!(!header.is_null());
+            assert_eq!((*header).cmsg_len, libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize);
+            std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>())
+        };
+        let remote = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::fcntl(remote.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE, libc::O_WRONLY);
+        remote.write_all_at(b"\x89PNG\r\n\x1a\n", 0).unwrap();
+        assert_eq!(std::fs::read(&sent_path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+    #[test]
+    fn screenshot_file_appears_only_when_complete_and_respects_existing_files() {
+        use std::os::unix::fs::FileExt;
+        let folder = std::env::temp_dir().join(format!("anvil-shot-save-{}", std::process::id()));
+        std::fs::create_dir(&folder).unwrap();
+        let names = || { let mut names: Vec<_> = std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect(); names.sort(); names };
+        let png = |bytes: &'static [u8]| move |file: &std::fs::File| {
+            file.write_all_at(bytes, 0).unwrap();
+            Ok(serde_json::json!({"runtime_id":"default","bytes":bytes.len(),"width":2,"height":1}))
+        };
+        let target = folder.join("shot.png");
+        let saved = save_screenshot(&target, false, png(b"\x89PNG first")).unwrap();
+        assert_eq!(saved["width"], 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x89PNG first");
+        assert_eq!(names(), ["shot.png"]);
+        // Without overwrite an existing file is refused before any capture.
+        let error = save_screenshot(&target, false, |_| panic!("must not capture")).unwrap_err();
+        assert!(error.ends_with("already exists. Choose another file name."), "{error}");
+        // A file that appears during the capture is not replaced either.
+        let racing = folder.join("race.png");
+        let error = save_screenshot(&racing, false, |file| { std::fs::write(&racing, b"theirs").unwrap(); png(b"\x89PNG mine")(file) }).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(std::fs::read(&racing).unwrap(), b"theirs");
+        std::fs::remove_file(&racing).unwrap();
+        // A failed, empty or short capture leaves the old picture and no stray file.
+        assert_eq!(save_screenshot(&target, true, |file| { file.write_all_at(b"\x89PNG par", 0).unwrap(); Err("Start this device first.".into()) }).unwrap_err(), "Start this device first.");
+        assert!(save_screenshot(&target, true, |_| Ok(serde_json::json!({"bytes":0}))).unwrap_err().contains("not written completely"));
+        assert!(save_screenshot(&target, true, |file| { file.write_all_at(b"abc", 0).unwrap(); Ok(serde_json::json!({"bytes":9})) }).unwrap_err().contains("not written completely"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x89PNG first");
+        assert_eq!(names(), ["shot.png"]);
+        save_screenshot(&target, true, png(b"\x89PNG second")).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x89PNG second");
+        assert_eq!(names(), ["shot.png"]);
+        assert!(save_screenshot(&folder, true, |_| panic!("must not capture")).unwrap_err().contains("is a folder"));
+        assert!(save_screenshot(&folder.join("missing/shot.png"), false, |_| panic!("must not capture")).unwrap_err().contains("Cannot create a file"));
+        assert!(save_screenshot(std::path::Path::new("/"), false, |_| panic!("must not capture")).is_err());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+    #[test]
     fn rejects_unprivileged_server_before_sending() {
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -879,5 +1161,81 @@ mod tests {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut server, &mut bytes).unwrap();
         assert!(bytes.is_empty());
+    }
+    #[test]
+    fn logs_request_round_trips_with_every_field_present() {
+        for value in [
+            serde_json::json!({"op":"logs_get","id":"default","lines":500,"level":"I","package":null,"since":null}),
+            serde_json::json!({"op":"logs_get","id":"r-11111111111111111111111111111111","lines":2000,"level":"W",
+                               "package":"com.example.app","since":"1795077058189000000:0123abcd,89abcdef"}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+            for (key, extra) in [("path", serde_json::json!("/etc")), ("uid", serde_json::json!(0)), ("follow", serde_json::json!(true))] {
+                let mut invalid = value.clone();
+                invalid[key] = extra;
+                assert!(serde_json::from_value::<Request>(invalid).is_err());
+            }
+        }
+        for invalid in [
+            serde_json::json!({"op":"logs_get","lines":500,"level":"I","package":null,"since":null}),
+            serde_json::json!({"op":"logs_get","id":"default","lines":"500","level":"I","package":null,"since":null}),
+            serde_json::json!({"op":"logs_get","id":"default","lines":-1,"level":"I","package":null,"since":null}),
+            serde_json::json!({"op":"logs_get","id":"default","lines":500,"package":null,"since":null}),
+            serde_json::json!({"op":"logs_get","id":"default","lines":500,"level":"I","package":["a"],"since":null}),
+        ] {
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
+    }
+    #[test]
+    fn network_requests_round_trip_with_every_field_present() {
+        let set = serde_json::json!({"op":"network_set","id":"r-11111111111111111111111111111111","proxy_host":"192.168.1.10",
+                                     "proxy_port":3128,"proxy_bypass":["localhost","*.lan"],"dns_mode":"hostname",
+                                     "dns_hostname":"dns.adguard.com"});
+        for value in [
+            serde_json::json!({"op":"network_get","id":"default"}),
+            set.clone(),
+            serde_json::json!({"op":"network_set","id":"default","proxy_host":"","proxy_port":0,"proxy_bypass":[],
+                               "dns_mode":"automatic","dns_hostname":""}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+            // Android's global proxy has no credentials, and no caller field is privileged.
+            for (key, extra) in [("username", serde_json::json!("u")), ("password", serde_json::json!("p")),
+                                 ("uid", serde_json::json!(0)), ("path", serde_json::json!("/etc"))] {
+                let mut invalid = value.clone();
+                invalid[key] = extra;
+                assert!(serde_json::from_value::<Request>(invalid).is_err());
+            }
+        }
+        for key in ["id", "proxy_host", "proxy_port", "proxy_bypass", "dns_mode", "dns_hostname"] {
+            let mut missing = set.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Request>(missing).is_err(), "missing {key}");
+        }
+        for (key, wrong) in [("proxy_port", serde_json::json!("3128")), ("proxy_port", serde_json::json!(65536)),
+                             ("proxy_port", serde_json::json!(-1)), ("proxy_port", serde_json::json!(true)),
+                             ("proxy_bypass", serde_json::json!("localhost")), ("proxy_bypass", serde_json::json!(null)),
+                             ("proxy_host", serde_json::json!(null)), ("dns_hostname", serde_json::json!(null))] {
+            let mut invalid = set.clone();
+            invalid[key] = wrong;
+            assert!(serde_json::from_value::<Request>(invalid).is_err(), "wrong {key}");
+        }
+    }
+    #[test]
+    fn performance_request_round_trips_and_takes_no_arguments() {
+        for id in ["default", "r-11111111111111111111111111111111"] {
+            let value = serde_json::json!({"op":"performance_get","id":id});
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+            for (key, extra) in [("package", serde_json::json!("com.example.app")), ("layer", serde_json::json!("SurfaceView[a/b]#1")),
+                                 ("uid", serde_json::json!(0)), ("command", serde_json::json!("id"))] {
+                let mut invalid = value.clone();
+                invalid[key] = extra;
+                assert!(serde_json::from_value::<Request>(invalid).is_err(), "extra {key}");
+            }
+        }
+        assert!(serde_json::from_value::<Request>(serde_json::json!({"op":"performance_get"})).is_err());
+        assert!(serde_json::from_value::<Request>(serde_json::json!({"op":"performance_get","id":7})).is_err());
     }
 }

@@ -409,7 +409,7 @@ test('frontend runtime calls carry an explicit target and catalog/version calls 
   const { context } = gui(async (name, args) => { calls.push([name, args]); });
   await vm.runInContext("invoke('stop_runtime'); invoke('set_favorite', { package: 'com.example.game', enabled: true }); invoke('get_runtime_catalog')", context);
   for (const [name, args] of calls) {
-    if (['get_runtime_catalog', 'get_app_version', 'runtime_controller', 'get_application_preferences'].includes(name)) assert.equal(args?.runtimeId, undefined);
+    if (['get_runtime_catalog', 'get_app_version', 'runtime_controller', 'get_application_preferences', 'take_pending_apk'].includes(name)) assert.equal(args?.runtimeId, undefined);
     else assert.equal(args.runtimeId, 'default', name);
   }
   assert.equal(calls.find(([name]) => name === 'set_favorite')[1].package, 'com.example.game');
@@ -1370,7 +1370,7 @@ for (const mode of ['success','partial-failure','transport-error','stopped','ren
   const calls=[];
   const records=[{id:'default',name:'Default',state:'Frozen'},{id:'r-two',name:'Second',state:'Running'}];
   const {context,element}=gui(async(command,args)=>{
-   if(command==='install_apk') {
+   if(command==='install_prepared_apk') {
     calls.push(args);
     assert.equal(element('apk-install-bar').value,args.runtimeId==='default'?0:1);
     assert.match(element('apk-install-bar').className,/is-installing/);
@@ -1380,9 +1380,9 @@ for (const mode of ['success','partial-failure','transport-error','stopped','ren
   });await tick();
   context.installFixtures=records;
   vm.runInContext(`refreshBatchRecord=async id=>({...installFixtures.find(record=>record.id===id),...(${JSON.stringify(mode)}==='stopped'&&id==='default'?{state:'Stopped'}:${JSON.stringify(mode)}==='renamed'&&id==='default'?{name:'Changed'}:{})});`,context);
-  const results=await context.runApkInstall(records,['default','r-two'],'/tmp/game.apk');
+  const results=await context.runApkInstall(records,['default','r-two'],{plan:7,packages:[{name:'com.example.game (game.apk)',notice:null}],rejected:[]});
   assert.equal(calls.length,['stopped','renamed'].includes(mode)?1:2);
-  assert(calls.every(call=>call.path==='/tmp/game.apk'));
+  assert(calls.every(call=>call.plan===7&&call.index===0&&call.path===undefined));
   assert.equal(element('apk-install-bar').max,2);
   assert.equal(element('apk-install-bar').value,2);
   assert.equal(element('apk-install-bar').className,'');
@@ -1410,9 +1410,12 @@ test('APK modal opens before loading runtimes even when none are running',async(
 });
 
 test('APK modal selects file and Frozen runtimes, stays open during progress and blocks duplicates',async()=>{
- const gate=deferred();let installs=0;
+ const gate=deferred();let installs=0;const commands=[],discarded=[];
  const {context,element}=gui(async(command,args)=>{
-  if(command==='install_apk'){installs++;return gate.promise;}
+  commands.push(command);
+  if(command==='prepare_apk_install'){assert.deepEqual(Array.from(args.paths),['/tmp/game.apk']);return {plan:3,packages:[{name:'com.example.game (game.apk)',notice:null}],rejected:[]};}
+  if(command==='install_prepared_apk'){installs++;assert.equal(args.plan,3);return gate.promise;}
+  if(command==='discard_apk_install')discarded.push(args.plan);
  });await tick();
  vm.runInContext(`runtimeTransition=null; loadApkTargets=async()=>[{id:'default',name:'Default',state:'Frozen'}]; refreshBatchRecord=async()=>({id:'default',name:'Default',state:'Frozen'}); refreshApps=async()=>{}; refreshManagedLibrary=async()=>{};`,context);
  const input={value:'default',checked:true,disabled:false};
@@ -1428,12 +1431,219 @@ test('APK modal selects file and Frozen runtimes, stays open during progress and
  assert.equal(element('apk-install-cancel').disabled,true);
  let prevented=false;element('apk-install-dialog').oncancel({preventDefault(){prevented=true;}});assert(prevented);
  await context.installApk();assert.equal(installs,1);
+ // The files stay prepared until every device is done.
+ assert.deepEqual(discarded,[]);
  gate.resolve({success:true,message:'Installed'});await task;
- assert.match(element('apk-install-progress-label').textContent,/1 completed/);
+ assert.match(element('apk-install-progress-label').textContent,/^1 completed · 0 failed · 0 skipped$/);
+ assert.deepEqual(discarded,[3]);
+ assert(commands.indexOf('prepare_apk_install')<commands.indexOf('install_prepared_apk'));
  assert.equal(element('apk-install-cancel').textContent,'Close');
  assert.equal(element('apk-install-cancel').disabled,false);
  element('apk-install-cancel').onclick();assert.equal(element('apk-install-dialog').open,false);
  assert.equal(element('btn-install-apk').disabled,false);
+});
+
+test('APK opened from the file manager shows the dialog with that file selected',async()=>{
+ const installed=[],prepared=[];
+ const {context,element}=gui(async(command,args)=>{
+  if(command==='take_pending_apk')return [];
+  if(command==='prepare_apk_install'){prepared.push(Array.from(args.paths));return {plan:1,packages:[{name:'org.example.other (other.apk)',notice:null}],rejected:[]};}
+  if(command==='install_prepared_apk'){installed.push(args);return {success:true,message:'ok'};}
+ });await tick();
+ vm.runInContext(`runtimeTransition=null; loadApkTargets=async()=>[{id:'default',name:'Default',state:'Running'}]; refreshBatchRecord=async()=>({id:'default',name:'Default',state:'Running'}); refreshApps=async()=>{}; refreshManagedLibrary=async()=>{};`,context);
+ const input={value:'default',checked:true,disabled:false};
+ element('apk-install-targets').querySelectorAll=()=>[input];
+ let picker=0;context.window.__TAURI__.dialog.open=async()=>{picker++;return null;};
+ const task=context.openApkFile('/home/user/Downloads/My <Game>.apk');await tick();
+ assert.equal(element('apk-install-dialog').open,true);
+ assert.equal(element('apk-install-file').textContent,'My <Game>.apk');
+ assert.equal(element('apk-install-file').title,'/home/user/Downloads/My <Game>.apk');
+ assert.equal(element('apk-install-submit').disabled,false);
+ // A second file opened while choosing replaces the first one.
+ await context.openApkFile('/home/user/other.apk');
+ assert.equal(element('apk-install-file').textContent,'other.apk');
+ assert.equal(element('apk-install-submit').disabled,false);
+ element('apk-install-form').onsubmit({preventDefault(){}});await task;
+ assert.equal(picker,0);
+ assert.deepEqual(prepared,[['/home/user/other.apk']]);
+ assert.deepEqual(installed.map(args=>[args.runtimeId,args.plan,args.index]),[['default',1,0]]);
+ // The next manual install starts without a file.
+ const manual=context.installApk();await tick();
+ assert.match(element('apk-install-file').textContent,/^No files selected\. Choose or drop \.apk, \.apks, \.xapk or \.apkm files\.$/);
+ assert.match(fs.readFileSync('crates/anvildroid-gui/src-frontend/index.html','utf8'),/<p id="apk-install-file">No files selected\. Choose or drop \.apk, \.apks, \.xapk or \.apkm files\.<\/p>/);
+ assert.equal(element('apk-install-file').title,'');
+ assert.equal(element('apk-install-submit').disabled,true);
+ element('apk-install-cancel').onclick();await manual;
+});
+
+test('APK opened while devices are still loading or another operation runs',async()=>{
+ const gate=deferred();const {context,element}=gui(async()=>undefined);await tick();
+ context.targetGate=gate.promise;
+ vm.runInContext('loadApkTargets=()=>targetGate; runtimeTransition=null;',context);
+ const input={value:'default',checked:true,disabled:false};
+ element('apk-install-targets').querySelectorAll=()=>[input];
+ const task=context.openApkFile('/tmp/first.apk');await tick();
+ assert.equal(element('apk-install-file').textContent,'first.apk');
+ await context.openApkFile('/tmp/second.apk');
+ assert.equal(element('apk-install-file').textContent,'second.apk');
+ gate.resolve([{id:'default',name:'Default',state:'Running'}]);await tick();await tick();
+ assert.equal(element('apk-install-file').textContent,'second.apk');
+ assert.equal(element('apk-install-submit').disabled,false);
+ element('apk-install-cancel').onclick();await task;
+ assert.equal(element('apk-install-dialog').open,false);
+ // Another operation: the file waits, then opens when the operation ends.
+ context.setTimeout=(callback,delay)=>setTimeout(callback,Math.min(delay,20));
+ vm.runInContext('controllerMutation=true; loadApkTargets=async()=>[]',context);
+ const waiting=context.openApkFile('/tmp/third.apk');await tick();
+ assert.equal(element('apk-install-dialog').open,false);
+ vm.runInContext('controllerMutation=false',context);
+ await new Promise(resolve=>setTimeout(resolve,120));
+ assert.equal(element('apk-install-dialog').open,true);
+ assert.equal(element('apk-install-file').textContent,'third.apk');
+ element('apk-install-cancel').onclick();await waiting;
+ await context.openApkFile('');await context.openApkFile({isTrusted:true});
+ assert.equal(element('apk-install-dialog').open,false);
+});
+
+test('pending APK is taken from the backend at startup and on the open-apk event',async()=>{
+ let pending='/tmp/start.apk';const opened=[];
+ const calls=[];
+ const {context}=gui(async command=>{calls.push(command);if(command==='take_pending_apk'){const value=pending;pending=null;return value;}});
+ vm.runInContext('openApkFile=async paths=>{openedPaths.push(paths.join(","));}',Object.assign(context,{openedPaths:opened}));
+ await tick();await tick();
+ assert.deepEqual(opened,['/tmp/start.apk']);
+ assert.equal(calls.filter(command=>command==='take_pending_apk').length,1);
+ await context.openPendingApk();assert.equal(opened.length,1);
+ pending=[];await context.openPendingApk();assert.equal(opened.length,1);
+ // Several files selected in the file manager arrive as one selection.
+ pending=['/tmp/base.apk','/tmp/split_config.en.apk','/tmp/game.xapk'];await context.openPendingApk();
+ assert.deepEqual(opened,['/tmp/start.apk','/tmp/base.apk,/tmp/split_config.en.apk,/tmp/game.xapk']);
+ // The running window is told through the event, never by a path in the event.
+ const source=fs.readFileSync('crates/anvildroid-gui/src-frontend/main.js','utf8');
+ assert.match(source,/event\?\.listen\?\.\('open-apk', \(\) => \{ openPendingApk\(\); \}\)/);
+});
+
+test('several files and bundles: one session per app, apps in order on every device, clear results',async()=>{
+ const calls=[],discarded=[];let preparedPaths=null;
+ const plan={plan:9,packages:[{name:'com.example.game (Game <1>.xapk, 4 APKs)',notice:'1 expansion file (OBB, 300 MB) in Game <1>.xapk was not installed.'},{name:'org.example.tool (tool.apk, 2 APKs)',notice:null}],
+  rejected:[{file:'split_<x>.apk',reason:'This is a split APK of com.other and its base APK is not selected.'}]};
+ const {context,element}=gui(async(command,args)=>{
+  if(command==='prepare_apk_install'){preparedPaths=Array.from(args.paths);assert.equal(element('apk-install-progress-label').textContent,'Preparing files…');return plan;}
+  if(command==='install_prepared_apk'){
+   calls.push([args.runtimeId,args.plan,args.index]);
+   if(args.index===1)assert.match(element('apk-install-progress-label').textContent,/· app 2\/2$/);
+   return args.runtimeId==='r-two'&&args.index===1?{success:false,message:'Failure [INSTALL_FAILED_NO_MATCHING_ABIS] <abi>'}:{success:true,message:'Installed'};
+  }
+  if(command==='discard_apk_install')discarded.push(args.plan);
+ });await tick();
+ vm.runInContext(`runtimeTransition=null; installFixtures=[{id:'default',name:'Default',state:'Running'},{id:'r-two',name:'Second',state:'Running'}]; loadApkTargets=async()=>installFixtures; refreshBatchRecord=async id=>installFixtures.find(record=>record.id===id); refreshApps=async()=>{}; refreshManagedLibrary=async()=>{};`,context);
+ const inputs=[{value:'default',checked:true,disabled:false},{value:'r-two',checked:true,disabled:false}];
+ element('apk-install-targets').querySelectorAll=()=>inputs;
+ // The picker allows several files and the bundle formats; a file chosen twice counts once.
+ let options=null;
+ context.window.__TAURI__.dialog.open=async value=>{options=value;return ['/d/Game <1>.xapk','/d/tool.apk',{path:'/d/split_config.en.apk'},'/d/split_<x>.apk','/d/tool.apk'];};
+ const task=context.installApk();await tick();
+ await element('apk-install-pick').onclick();
+ assert.equal(options.multiple,true);
+ assert.deepEqual(Array.from(options.filters[0].extensions),['apk','apks','xapk','apkm']);
+ assert.equal(element('apk-install-file').textContent,'4 files: Game <1>.xapk, tool.apk, split_config.en.apk and 1 more');
+ assert.equal(element('apk-install-file').title,'/d/Game <1>.xapk\n/d/tool.apk\n/d/split_config.en.apk\n/d/split_<x>.apk');
+ element('apk-install-form').onsubmit({preventDefault(){}});await task;
+ assert.deepEqual(preparedPaths,['/d/Game <1>.xapk','/d/tool.apk','/d/split_config.en.apk','/d/split_<x>.apk']);
+ assert.deepEqual(calls,[['default',9,0],['default',9,1],['r-two',9,0],['r-two',9,1]]);
+ assert.equal(element('apk-target-state-default').textContent,'Installed');
+ assert.equal(element('apk-target-state-r-two').textContent,'Failed · 1 of 2 apps');
+ assert.equal(element('apk-install-progress-label').textContent,'1 completed · 1 failed · 0 skipped · 1 file not installed');
+ const details=element('apk-install-error-details').innerHTML;
+ assert.match(details,/split_&lt;x&gt;\.apk · Not installed<\/summary><pre>This is a split APK of com\.other/);
+ assert.match(details,/Game &lt;1&gt;\.xapk, 4 APKs\) · Expansion files \(OBB\) not installed<\/summary><pre>1 expansion file \(OBB, 300 MB\)/);
+ assert.match(details,/Second · 1 of 2 apps not installed<\/summary>.*<pre>org\.example\.tool \(tool\.apk, 2 APKs\): Failure \[INSTALL_FAILED_NO_MATCHING_ABIS\] &lt;abi&gt;<\/pre>/);
+ assert.doesNotMatch(details,/<abi>|<x>|<1>/);
+ assert.deepEqual(discarded,[9]);
+ assert.equal(element('apk-install-cancel').textContent,'Close');
+ // Files dropped while these results are still shown start a new selection.
+ assert.equal(element('apk-install-dialog').open,true);
+ element('apk-install-dialog').showModal=()=>{throw Error('InvalidStateError: the dialog is already open');};
+ context.openDroppedFiles(['/d/next.apk']);await tick();
+ assert.equal(element('apk-install-dialog').open,true);
+ assert.equal(element('apk-install-file').textContent,'next.apk');
+ assert.equal(element('apk-install-cancel').textContent,'Cancel');
+ assert.equal(element('apk-install-submit').hidden,false);
+ assert.equal(element('apk-install-progress').hidden,true);
+ assert.equal(element('apk-install-error-details').innerHTML,'');
+ element('apk-install-cancel').onclick();await tick();
+ assert.equal(element('apk-install-dialog').open,false);
+});
+
+test('files that cannot be installed are explained and nothing is sent to a device',async()=>{
+ const commands=[];
+ const {context,element}=gui(async(command,args)=>{
+  commands.push(command);
+  if(command==='prepare_apk_install')return {plan:4,packages:[],rejected:[{file:'notes.apkm',reason:'Not a ZIP-based package bundle (the file is damaged or encrypted)'}]};
+ });await tick();
+ vm.runInContext(`runtimeTransition=null; loadApkTargets=async()=>[{id:'default',name:'Default',state:'Running'}]; refreshBatchRecord=async()=>({id:'default',name:'Default',state:'Running'}); refreshApps=async()=>{}; refreshManagedLibrary=async()=>{};`,context);
+ element('apk-install-targets').querySelectorAll=()=>[{value:'default',checked:true,disabled:false}];
+ const task=context.openApkFile(['/d/notes.apkm']);await tick();
+ element('apk-install-form').onsubmit({preventDefault(){}});await task;
+ assert(!commands.includes('install_prepared_apk'));
+ assert.match(element('apk-install-error').textContent,/None of the selected files can be installed/);
+ assert.equal(element('apk-install-progress-label').textContent,'Nothing was installed');
+ assert.equal(element('apk-target-state-default').textContent,'Not started');
+ assert.match(element('apk-install-error-details').innerHTML,/notes\.apkm · Not installed<\/summary><pre>Not a ZIP-based package bundle/);
+ assert.equal(element('apk-install-cancel').disabled,false);
+ assert(commands.includes('discard_apk_install'));
+ // A broken answer from the backend is an error, not an empty success.
+ const {context:second,element:secondElement}=gui(async command=>command==='prepare_apk_install'?{plan:5}:undefined);await tick();
+ vm.runInContext(`runtimeTransition=null; loadApkTargets=async()=>[{id:'default',name:'Default',state:'Running'}];`,second);
+ secondElement('apk-install-targets').querySelectorAll=()=>[{value:'default',checked:true,disabled:false}];
+ const broken=second.openApkFile('/d/game.apk');await tick();
+ secondElement('apk-install-form').onsubmit({preventDefault(){}});await broken;
+ assert.match(secondElement('apk-install-error').textContent,/Invalid install plan/);
+});
+
+test('an install Android did not confirm is not reported as failed or cancelled, and is not repeated',async()=>{
+ const calls=[];let refreshed=0;
+ const {context,element}=gui(async(command,args)=>{
+  if(command==='install_prepared_apk'){calls.push(args.runtimeId);return {success:false,message:args.runtimeId==='default'
+   ?'Android install timed out; it may still complete. Refresh before retrying.'
+   :'Installation result is unknown. Check this runtime in Settings before retrying.'};}
+ });await tick();
+ context.installFixtures=[{id:'default',name:'Default',state:'Running'},{id:'r-two',name:'Second',state:'Running'}];
+ vm.runInContext('refreshBatchRecord=async id=>installFixtures.find(record=>record.id===id);',context);
+ const results=await context.runApkInstall(context.installFixtures,['default','r-two'],{plan:2,packages:[{name:'com.example.game (game.apk)',notice:null}],rejected:[]});
+ assert.deepEqual(calls,['default','r-two']);
+ for(const id of ['default','r-two'])assert.equal(element(`apk-target-state-${id}`).textContent,'Not confirmed · Check the device before retrying');
+ assert.match(element('apk-install-error-details').innerHTML,/Default · Not confirmed\. Check the device before retrying<\/summary>/);
+ assert.doesNotMatch(element('apk-install-error-details').innerHTML,/cancel/i);
+ assert(results.every(result=>context.apkOutcomeUnknown(result.message)));
+ assert.equal(context.apkOutcomeUnknown('Failure [INSTALL_FAILED_VERSION_DOWNGRADE]'),false);
+ assert.equal(context.apkInstallErrorSummary('Failure [INSTALL_FAILED_MISSING_SPLIT]'),'A required split APK is missing');
+});
+
+test('files dropped on the window open the install dialog with the package files selected',async()=>{
+ const {context,element}=gui(async()=>undefined);await tick();
+ const toasts=[];context.toasts=toasts;
+ vm.runInContext(`runtimeTransition=null; showAppToast=(message,kind)=>{toasts.push(kind+': '+message);}; loadApkTargets=async()=>[{id:'default',name:'Default',state:'Running'}];`,context);
+ element('apk-install-targets').querySelectorAll=()=>[{value:'default',checked:true,disabled:false}];
+ // Only other kinds of files: a hint, no dialog.
+ context.openDroppedFiles(['/d/readme.txt','/d/photo.apk.png']);await tick();
+ assert(!element('apk-install-dialog').open);
+ assert.deepEqual(toasts,['info: Drop .apk, .apks, .xapk or .apkm files to install them.']);
+ for(const nothing of [undefined,null,[],[42,''],{paths:['/d/a.apk']}])context.openDroppedFiles(nothing);
+ await tick();
+ assert(!element('apk-install-dialog').open);
+ assert.equal(toasts.length,1);
+ context.openDroppedFiles(['/d/base.apk','/d/readme.txt','/d/Game.XAPK','/d/set.apks','/d/mirror.apkm','/d/base.apk']);await tick();
+ assert.equal(element('apk-install-dialog').open,true);
+ assert.equal(element('apk-install-file').textContent,'4 files: base.apk, Game.XAPK, set.apks and 1 more');
+ assert.equal(element('apk-install-submit').disabled,false);
+ // A drop while choosing replaces the selection.
+ context.openDroppedFiles(['/d/other.apk']);await tick();
+ assert.equal(element('apk-install-file').textContent,'other.apk');
+ element('apk-install-cancel').onclick();await tick();
+ assert.equal(element('apk-install-dialog').open,false);
+ const source=fs.readFileSync('crates/anvildroid-gui/src-frontend/main.js','utf8');
+ assert.match(source,/listen\?\.\('tauri:\/\/drag-drop', event => \{ openDroppedFiles\(event\?\.payload\?\.paths\); \}\)/);
 });
 
 test('APK modal Escape cancels selection and file picker cancellation leaves Install disabled',async()=>{
@@ -2588,6 +2798,38 @@ for (const mode of ['success','cancel','stop-failure','name-change','double-clic
  });
 }
 
+
+for (const mode of ['backup-first','backup-declined','backup-failure','backup-cancelled']) {
+ test(`reinstall offers a backup of Android data first: ${mode}`,async()=>{
+  const id='r-'+'b'.repeat(32);let state='Running',job={id:'stop-job',status:'Succeeded'};const calls=[],dialogs=[];
+  const report=backupJob=>({runtime_id:id,backups:[],job:backupJob,ready:true,blocked:null,limit:null,has_data:true,location:{path:'/mnt/data',external:true}});
+  const {context,banner}=gui(async(command,args)=>{
+   if(command!=='runtime_controller')return {};
+   const r=args.request;
+   if(r.op==='backups_get')return report(null);
+   if(r.op==='backup_create'){calls.push('backup');assert.equal(state,'Stopped');
+    return report({id:'c'.repeat(32),action:'backup',backup_id:'d'.repeat(32),status:mode==='backup-failure'?'Failed':mode==='backup-cancelled'?'Cancelled':'Succeeded',
+     phase:'Done',cancellable:false,error:mode==='backup-failure'?'Not enough free space':null,done_bytes:1,total_bytes:1});}
+   if(r.op==='refresh')return {id,name:'Test',state,managed:true,job};
+   if(r.op==='stop'){calls.push('stop');state='Stopped';return {id,job:{id:'stop-job'}};}
+   if(r.op==='reinstall'){calls.push('reinstall');state='Prepared';job={id:'prepare-job',operation:'prepare',status:'Succeeded'};return {id,name:'Test',state:'Provisioning',job:{id:'prepare-job',operation:'prepare',status:'Running'}};}
+   if(r.op==='start'){calls.push('start');state='Running';job={id:'start-job',operation:'start',status:'Succeeded'};return {id,job:{id:'start-job',operation:'start'}};}
+   if(r.op==='list')return [{id,name:'Test',state}];
+   if(r.op==='app_job')return null;
+   if(r.op==='display_info')return {mode:'desktop'};
+   return {};
+  },async(message,options)=>{dialogs.push([options?.title,message]);return !(mode==='backup-declined'&&options?.title==='Back up Android data first?');}, '?view=settings');
+  await tick();
+  vm.runInContext('window',context).AnvilRuntimeBackups=require('../crates/anvildroid-gui/src-frontend/runtime-backups.js');
+  for (const [name, file] of [['Network','network'], ['Logs','logs'], ['Activity','activity'], ['Capture','capture']]) vm.runInContext('window',context)['AnvilRuntime'+name]=require(`../crates/anvildroid-gui/src-frontend/runtime-${file}.js`);
+  vm.runInContext(`controllerRecords=[{id:'${id}',name:'Test',state:'Running'}]`,context);
+  await vm.runInContext(`mutateController({op:'reinstall',id:'${id}',confirmed_name:'Test',flavor:'installed'})`,context);
+  assert.deepEqual(dialogs.slice(0,2).map(item=>item[0]),['Back up Android data first?','Reinstall device']);
+  assert.equal(/backed up first/.test(dialogs[1][1]),mode!=='backup-declined');
+  assert.deepEqual(calls,mode==='backup-first'?['stop','backup','reinstall','start']:mode==='backup-declined'?['stop','reinstall','start']:['stop','backup']);
+  if(['backup-failure','backup-cancelled'].includes(mode))assert.match(banner.textContent,/not reinstalled and nothing was erased/);
+ });
+}
 
 test('app status updates preserve card identity and scroll position', async () => {
   const {context,element}=gui(async()=>undefined,undefined,'?view=settings');

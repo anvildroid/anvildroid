@@ -172,3 +172,78 @@
 .about-people { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:4px 14px; }
 .about-person { padding:0; border:0; background:none; font:inherit; color:var(--accent-text); cursor:pointer; }
 .about-person:hover { text-decoration:underline; }
+
+/* Device settings → Backups: one row per backup, its actions on the right. */
+.backup-list { list-style: none; margin: 12px 0; padding: 0; }
+.backup-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border-subtle); }
+.backup-row:first-child { border-top: 0; }
+.backup-row-text { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
+.backup-row .runtime-actions { flex-shrink: 0; margin: 0; }
+.backup-list .empty-state { padding: 24px 12px; }
+.runtime-backups-panel .runtime-inline-feature { margin-top: 0; padding-top: 0; border-top: 0; }
+
+/* Device settings → Screenshot */
+.runtime-capture-panel .runtime-inline-feature { margin-top: 0; padding-top: 0; border-top: 0; }
+.runtime-capture .capture-waiting { margin: 10px 0 0; }
+.runtime-capture .capture-waiting:empty { display: none; }
+.runtime-capture [role="status"] { margin: 10px 0 0; }
+
+/* Device settings → Logs: filters on top, one scrolling monospace list of lines. */
+.runtime-logs-panel .runtime-inline-feature { margin-top: 0; padding-top: 0; border-top: 0; }
+.runtime-logs { container-type: inline-size; }
+.runtime-logs .logs-controls { display: grid; grid-template-columns: minmax(120px, 160px) repeat(2, minmax(0, 1fr)); gap: 10px 12px; margin: 12px 0; }
+.runtime-logs .logs-field { display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; }
+.runtime-logs .logs-field select { width: 100%; min-width: 0; }
+.runtime-logs .runtime-actions { flex-wrap: wrap; }
+.runtime-logs .logs-status { margin: 10px 0 0; min-height: 1.5em; }
+.runtime-logs .logs-status:empty { display: none; }
+.runtime-logs .runtime-feedback { margin: 10px 0 0; }
+.runtime-logs [hidden] { display: none !important; }
+.runtime-logs .logs-view { height: clamp(180px, 46vh, 520px); margin-top: 10px; padding: 8px 10px; overflow: auto; overflow-wrap: anywhere;
+  color: var(--text-soft); background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: monospace; font-size: var(--font-sm); line-height: 1.45; white-space: pre-wrap; tab-size: 4; user-select: text; }
+.runtime-logs .logs-view:focus-visible { border-color: var(--accent); }
+.runtime-logs .log-line[data-level="V"], .runtime-logs .log-line[data-level="D"] { color: var(--text-muted); }
+.runtime-logs .log-line[data-level="W"] { color: var(--warning); }
+.runtime-logs .log-line[data-level="E"], .runtime-logs .log-line[data-level="F"] { color: var(--danger); }
+.runtime-logs .log-line[data-level="F"] { font-weight: 600; background: var(--danger-bg); }
+.runtime-logs .log-gap { margin: 4px 0; color: var(--text-muted); font-style: italic; text-align: center; }
+@container (max-width: 560px) { .runtime-logs .logs-controls { grid-template-columns: minmax(0, 1fr); } }
+@media (max-height: 640px) { .runtime-logs .logs-view { height: clamp(160px, 38vh, 520px); } }
+
+/* Device settings > Network: HTTP proxy and Private DNS form. */
+.runtime-network-panel .runtime-inline-feature { margin-top: 0; padding-top: 0; border-top: 0; }
+.runtime-network .network-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; max-width: 640px; margin: 12px 0 0; }
+.runtime-network .network-form > h4 { margin: 4px 0 0; }
+.runtime-network .network-form > :is(p, .runtime-actions) { margin: 0; }
+.runtime-network :is(.network-proxy, .network-bypass, .network-dns) { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
+.runtime-network .network-address { display: grid; grid-template-columns: minmax(0, 1fr) 110px; gap: 10px; }
+.runtime-network .network-field { flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; }
+.runtime-network .network-field select { width: 100%; min-width: 0; }
+.runtime-network :is(.network-proxy, .network-bypass) > p { margin: 0; }
+.runtime-network .network-blocked { margin: 10px 0 0; }
+.runtime-network > [role="status"] { margin: 12px 0 0; }
+.runtime-network > [role="status"]:empty { display: none; }
+.runtime-network [hidden] { display: none !important; }
+
+/* Device settings → Activity: the app in front with its frame rate, then the busiest processes. */
+.runtime-activity-panel .runtime-inline-feature { margin-top: 0; padding-top: 0; border-top: 0; }
+.runtime-activity [hidden] { display: none !important; }
+.runtime-activity .activity-notice { margin: 0; }
+.activity-front { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 24px; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-surface); }
+.activity-front-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.activity-label { color: var(--text-muted); font-size: var(--font-xs); font-weight: 600; }
+.activity-front-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; font-size: var(--font-md); }
+.activity-front-rate { font-size: var(--font-md); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-front-hint { margin: 6px 0 0; }
+.activity-table { width: 100%; margin-top: 12px; border-collapse: collapse; table-layout: fixed; font-size: var(--font-sm); }
+.activity-table th { padding: 6px 8px; color: var(--text-muted); font-size: var(--font-xs); font-weight: 600; text-align: left; border-bottom: 1px solid var(--border); }
+.activity-table td { padding: 5px 8px; border-bottom: 1px solid var(--border-subtle); }
+.activity-table th.activity-number { width: 96px; }
+.activity-table .activity-number { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-name { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; overflow-wrap: normal; }
+.activity-name-main { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-name-part { flex: 0 2 auto; min-width: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.activity-tag { flex: 0 0 auto; padding: 0 6px; border: 1px solid var(--accent); border-radius: var(--radius-sm); color: var(--accent-text); font-size: var(--font-xs); white-space: nowrap; }
+.activity-rest, .activity-table-hint { margin: 8px 0 0; }
+.activity-note { margin: 10px 0 0; }

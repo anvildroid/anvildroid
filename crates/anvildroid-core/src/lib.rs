@@ -1,3 +1,4 @@
+pub mod apk_set;
 pub mod apps;
 pub mod backend;
 pub mod config;

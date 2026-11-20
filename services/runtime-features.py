@@ -24,6 +24,8 @@ linux = module('runtime-linux')
 device = module('runtime-device')
 notifications = module('runtime-notifications')
 camera = module('runtime-camera')
+backup = module('runtime-backup')
+inspect = module('runtime-inspect')
 
 FIELDS = {
     'device_info': {'op', 'id'},
@@ -43,6 +45,8 @@ FIELDS = {
     'camera_get': {'op', 'id'},
     'camera_set': {'op', 'id', 'enabled', 'devices'},
 }
+FIELDS.update(backup.FIELDS)
+FIELDS.update(inspect.FIELDS)
 
 
 def authorize(store, identifier, uid):
@@ -135,10 +139,15 @@ def diagnostic_session(store, identifier, uid):
 
 def dispatch(store, request, uid, descriptor=None):
     op = request.get('op')
-    if op not in FIELDS or set(request) != FIELDS[op] or descriptor is not None:
+    if op not in FIELDS or set(request) != FIELDS[op] or (descriptor is not None and op not in inspect.FIELDS):
         raise RuntimeError('Unexpected feature fields or file descriptor')
+    if op in backup.FIELDS:
+        # Status and cancel must answer while a backup job holds the device.
+        return backup.dispatch(store, request, uid)
     record = authorize(store, request['id'], uid)
     identifier = request['id']
+    if op in inspect.FIELDS:
+        return inspect.dispatch(store, request, uid, record, descriptor)
     if op in ('device_info', 'device_set'):
         if identifier == 'default':
             if op == 'device_info': return device.default_info(store.existing, uid)

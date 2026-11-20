@@ -3,6 +3,7 @@ import os
 import subprocess
 import signal
 import tempfile
+import time
 import re
 import sys
 import sqlite3
@@ -162,12 +163,142 @@ def run_bounded(*args, timeout, umask=-1, stdin=subprocess.DEVNULL, operation="A
         return text
 
 
+WINDOW_MODE_INIT = ('# AnvilDroid window mode\n'
+                    'on load_persist_props_action\n'
+                    '    setprop persist.waydroid.multi_windows ')
+
+
+def window_mode_init(text, multi_windows):
+    """Make Android's init apply the window mode at every start.
+
+    Android keeps persist.* values in its data and they win over the defaults
+    in waydroid.prop. A value left there (an earlier Waydroid setup, a settings
+    tool, an imported device) made apps open as fullscreen tasks that were then
+    scaled into their desktop window. init runs this after it loaded the saved
+    values and before Android's services start, so the mode chosen for this
+    start is the one Android sees, and the one it saves."""
+    text = re.sub('(?m)^' + re.escape(WINDOW_MODE_INIT) + r'(?:true|false)\n', '', text)
+    return text.rstrip('\n') + '\n\n' + WINDOW_MODE_INIT + ('true' if multi_windows else 'false') + '\n'
+
+
 def android_command(args):
     # Android shell scripts (settings, ime, uiautomator) invoke `cmd`/app_process
     # by name. lxc-attach otherwise inherits a host PATH without /system/bin.
     if args and str(args[0]) == 'lxc-attach':
         return (args[0], '--set-var', 'PATH=/system/bin:/system/xbin:/vendor/bin', *args[1:])
     return args
+
+
+# Fixed text for Android's own shell. The session list is cut off because old
+# sessions are printed after the active ones and can be long.
+PACKAGE_SESSIONS = 'dumpsys package installs | head -c 262144'
+PACKAGE_PROBE = 'pm path android; ' + PACKAGE_SESSIONS
+
+
+def package_ready(output):
+    """The package service answered `pm path android`."""
+    return any(line.startswith('package:') for line in output.splitlines())
+
+
+# A session Android committed longer ago than this is not being installed any
+# more: a system process restart leaves such sessions listed as active for good.
+PACKAGE_SESSION_STALE_MS = 600_000
+
+
+def package_sessions(output, now_ms=None):
+    """IDs of the install sessions Android is committing right now.
+
+    A committed session holds Android's install lock until it ends. Sessions
+    that are only being downloaded or written are left out, and so is text
+    this parser does not know. Android 13 prints `Active Session N:`; a
+    session whose commit time is long past is a leftover, not work in progress.
+    """
+    if now_ms is None:
+        now_ms = time.time() * 1000
+    found, session, fields, active = set(), None, {}, False
+
+    def close():
+        committed = fields.get('mCommitted', fields.get('mSealed'))
+        if session is None or committed != 'true' or fields.get('mDestroyed') == 'true':
+            return
+        stamp = fields.get('committedMillis', '')
+        if stamp.isdigit() and 0 < int(stamp) <= now_ms - PACKAGE_SESSION_STALE_MS:
+            return
+        found.add(session)
+
+    for line in output.splitlines():
+        line = line.strip()
+        if line == 'Active install sessions:':
+            active = True
+        elif not active:
+            continue
+        elif line.endswith(' install sessions:'):
+            break
+        elif match := re.fullmatch(r'(?:Active )?Session (\d+):', line):
+            close()
+            session, fields = match.group(1), {}
+        elif session is not None:
+            for word in line.split():
+                key, mark, value = word.partition('=')
+                if mark and key in ('mCommitted', 'mSealed', 'mDestroyed', 'committedMillis'):
+                    fields.setdefault(key, value)
+    close()
+    return found
+
+
+def open_sessions(output, installer_uid, since_ms):
+    """IDs of sessions `installer_uid` created at or after `since_ms` and has
+    not committed. Only these may be abandoned without touching an install
+    that Android or another installer is working on."""
+    found, session, fields, active = set(), None, {}, False
+
+    def close():
+        created = fields.get('createdMillis', '')
+        if (session is not None and fields.get('mInstallerUid') == str(installer_uid)
+                and 'true' not in (fields.get('mCommitted'), fields.get('mSealed'), fields.get('mDestroyed'))
+                and created.isdigit() and int(created) >= since_ms):
+            found.add(session)
+
+    for line in output.splitlines():
+        line = line.strip()
+        if line == 'Active install sessions:':
+            active = True
+        elif not active:
+            continue
+        elif line.endswith(' install sessions:'):
+            break
+        elif match := re.fullmatch(r'(?:Active )?Session (\d+):', line):
+            close()
+            session, fields = match.group(1), {}
+        elif session is not None:
+            for word in line.split():
+                key, mark, value = word.partition('=')
+                if mark and key in ('mInstallerUid', 'mCommitted', 'mSealed', 'mDestroyed', 'createdMillis'):
+                    fields.setdefault(key, value)
+    close()
+    return found
+
+
+class PackageHold:
+    """Keep a device awake while Android installs a package, within a limit.
+
+    A session that never ends (waiting for a reboot or for an answer nobody
+    gives) stops counting after `limit` seconds, so it cannot keep the device
+    awake for good.
+    """
+    limit = 600
+
+    def __init__(self):
+        self.seen = {}
+
+    def busy(self, sessions, now):
+        self.seen = {session: self.seen.get(session, now) for session in sessions}
+        return any(now - first < self.limit for first in self.seen.values())
+
+    def slept(self, seconds):
+        """Time the device spent frozen does not count against a session, and
+        does not give a session that already used its time a fresh start."""
+        self.seen = {session: first + seconds for session, first in self.seen.items()}
 
 
 def limit_android_pids(pid):

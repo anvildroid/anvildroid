@@ -5,7 +5,7 @@ const AnvilSettingsTabs = (() => {
   const SECTION = 'details.runtime-settings-group, details.runtime-setting-row, details.runtime-details, details.runtime-image-details';
   // Most-used first; anything unknown keeps its place after these.
   const ORDER = ['graphics', 'display', 'performance', 'notifications', 'camera', 'device identity',
-    'google play', 'arm translation', 'android image', 'storage', 'managed copy', 'diagnostics', 'runtime details', 'session details'];
+    'google play', 'arm translation', 'android image', 'storage', 'backups', 'network', 'screenshot', 'activity', 'logs', 'managed copy', 'diagnostics', 'runtime details', 'session details'];
   const STORE = 'anvildroid.settingsTab';
 
   const keyOf = title => String(title || '').trim().toLowerCase().replace(/\s+/g, ' ');

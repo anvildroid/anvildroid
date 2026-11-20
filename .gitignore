@@ -51,6 +51,7 @@ test_*.py
 !/tests/test_runtime_arm.py
 !/tests/test_runtime_arm_defaults.py
 !/tests/test_runtime_arm_source.py
+!/tests/test_runtime_apk_install.py
 !/tests/test_*.cjs
 !/tests/keymap-x11-sink.c
 !/tests/keymap-advanced.c

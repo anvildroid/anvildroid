@@ -25,9 +25,12 @@ pub const HELP: &str = "Managed runtimes (created in the AnvilDroid GUI):
   --runtime ID stop [--wait] [--timeout SECONDS]
                                          Stop Android, keep app data
   --runtime ID apps [--json]             Installed apps (runtime must be running)
-  --runtime ID install FILE.apk          Install an APK and wait for Android to confirm
+  --runtime ID install FILE...           Install APKs, split APKs or bundles (.apks, .xapk,
+                                         .apkm) and wait for Android to confirm
   --runtime ID health [--json]           Health checks; exit 1 when a check failed
   --runtime ID run PACKAGE               Launch an app (starts the runtime if needed)
+  --runtime ID screenshot FILE.png       Save a picture of the Android display to a new file
+                                         (runtime must be running)
 Without --wait, start/stop return once the controller accepted the job.
 Exit codes: 0 ok, 1 failed, 2 usage, 3 not found, 4 busy/invalid state, 5 timeout.";
 

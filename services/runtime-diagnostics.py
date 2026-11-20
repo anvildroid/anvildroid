@@ -17,7 +17,9 @@ SECRET_KEY = re.compile(SENSITIVE_FIELD, re.I)
 # A quoted value may itself contain escaped quotes. Stopping at the first quote
 # exports the rest of that same credential.
 QUOTED_VALUE = r'''(?:"(?:\\[^\r\n]|[^"\\\r\n])*(?:"|\\?(?=[\r\n]|\Z))|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?(?=[\r\n]|\Z)))'''
-ASSIGNMENT = re.compile(r'\b([\w-]*' + SENSITIVE_FIELD + r'''[\w-]*)\b(["']?\s*[:=]\s*|\s+)(?:'''
+# The name around a sensitive word is bounded: unbounded repeats here made the
+# search quadratic on long runs of word characters, which an app can log.
+ASSIGNMENT = re.compile(r'\b([\w-]{0,64}' + SENSITIVE_FIELD + r'''[\w-]{0,64})\b(["']?\s*[:=]\s*|\s+)(?:'''
                         + QUOTED_VALUE + r'|[^\s,;}]+)', re.I)
 AUTH_HEADER = re.compile(r'''\b((?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)(["']?\s*[:=]\s*)(?:'''
                          + QUOTED_VALUE + r'|[^\r\n]+)', re.I)

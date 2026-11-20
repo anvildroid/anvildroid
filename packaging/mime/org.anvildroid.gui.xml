@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Split-package bundles have no shared MIME type; without one they are plain
+     ZIP files and "Open with AnvilDroid" is not offered for them. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-android-package-bundle">
+    <comment>Android package bundle</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.apks"/>
+    <glob pattern="*.xapk"/>
+    <glob pattern="*.apkm"/>
+  </mime-type>
+</mime-info>

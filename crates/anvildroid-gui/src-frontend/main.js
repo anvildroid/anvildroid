@@ -1499,6 +1499,27 @@ document.getElementById('favorites-only').addEventListener('change', () => rende
 
 // --- Install APK ---
 let apkInstallBusy = false;
+// An APK opened from the file manager. While the dialog still waits for a
+// choice, a later file replaces the selected one.
+let apkRequestedPath = [], apkChoosing = false, apkFileSetter = null;
+// APKs, split APKs and bundles. Files of one app are installed together.
+const APK_FILE_TYPES = ['apk', 'apks', 'xapk', 'apkm'];
+const APK_NO_FILES = 'No files selected. Choose or drop .apk, .apks, .xapk or .apkm files.';
+function apkFileName(path) { return String(path).split('/').pop(); }
+// One path or several, from the picker, the file manager or a drop.
+function apkPathList(value) {
+  return [...new Set((Array.isArray(value) ? value : [value]).filter(path => typeof path === 'string' && path))];
+}
+function apkSelectionLabel(paths) {
+  if (!paths.length) return APK_NO_FILES;
+  if (paths.length === 1) return apkFileName(paths[0]);
+  const names = paths.slice(0, 3).map(apkFileName).join(', ');
+  return `${paths.length} files: ${names}${paths.length > 3 ? ` and ${paths.length - 3} more` : ''}`;
+}
+function showApkSelection(paths) {
+  const label = document.getElementById('apk-install-file');
+  label.textContent = apkSelectionLabel(paths); label.title = paths.join('\n');
+}
 function apkTargetAvailable(record) {
   return ['Running', 'Frozen'].includes(record?.state) && !record.unavailable && !record.deletion_pending &&
     ![record.job, record.appJob, record.storage?.job].some(job => job?.status === 'Running');
@@ -1523,7 +1544,7 @@ function apkRuntimeImageLabel(record) {
   if (record.image_label) return `Waydroid ${record.image_label}`;
   return record.id === 'default' || record.import_source === 'default' ? 'System Waydroid image' : 'Installed Waydroid image';
 }
-function chooseApkTargets(records) {
+function chooseApkTargets(records, initialPaths = []) {
   const dialog = document.getElementById('apk-install-dialog');
   const form = document.getElementById('apk-install-form');
   const targets = document.getElementById('apk-install-targets');
@@ -1531,7 +1552,7 @@ function chooseApkTargets(records) {
   const cancel = document.getElementById('apk-install-cancel');
   const pick = document.getElementById('apk-install-pick');
   const error = document.getElementById('apk-install-error');
-  let path = '', picking = false, finished = false;
+  let paths = [], picking = false, finished = false;
   // Preselect the library filter; with all runtimes shown, the default runtime.
   const preferred = libraryRuntimeSelection || new Set([defaultRuntimeId()]);
   records = defaultRuntimeFirst(records);
@@ -1542,7 +1563,7 @@ function chooseApkTargets(records) {
   const update = () => {
     const available = Array.from(targets.querySelectorAll('tbody input')).filter(input => !input.disabled);
     const count = selected().length;
-    submit.disabled = !path || !count || picking;
+    submit.disabled = !paths.length || !count || picking;
     selectAll.disabled = !available.length;
     selectAll.checked = available.length > 0 && count === available.length;
     selectAll.indeterminate = count > 0 && count < available.length;
@@ -1552,16 +1573,21 @@ function chooseApkTargets(records) {
     targets.querySelectorAll('tbody input').forEach(input => { if (!input.disabled) input.checked = selectAll.checked; });
     update();
   };
+  const setFiles = value => {
+    paths = apkPathList(value);
+    showApkSelection(paths);
+    update();
+  };
   pick.disabled = false;
   pick.onclick = async () => {
     if (picking) return;
     picking = true; pick.disabled = true; update();
     try {
-      const file = await window.__TAURI__.dialog.open({multiple:false, filters:[{name:'APK', extensions:['apk']}], title:'Choose APK'});
-      if (finished || !file) return;
-      path = typeof file === 'string' ? file : file.path;
-      if (!path) throw new Error('Invalid APK path.');
-      document.getElementById('apk-install-file').textContent = path.split('/').pop();
+      const files = await window.__TAURI__.dialog.open({multiple:true, filters:[{name:'Android packages', extensions:APK_FILE_TYPES}], title:'Choose files to install'});
+      if (finished || !files) return;
+      const picked = apkPathList((Array.isArray(files) ? files : [files]).map(file => typeof file === 'string' ? file : file?.path));
+      if (!picked.length) throw new Error('Invalid file path.');
+      setFiles(picked);
     } catch (e) { if (!finished) error.textContent = String(e.message || e); }
     finally { picking = false; if (!finished) { pick.disabled = false; update(); } }
   };
@@ -1571,29 +1597,46 @@ function chooseApkTargets(records) {
       finished = true;
       form.onsubmit = dialog.oncancel = dialog.onclose = cancel.onclick = targets.onchange = pick.onclick = null;
       selectAll.onchange = null;
+      apkFileSetter = null;
       resolve(value);
     };
-    form.onsubmit = event => { event.preventDefault(); if (!submit.disabled) finish({ids:selected(), path}); };
+    form.onsubmit = event => { event.preventDefault(); if (!submit.disabled) finish({ids:selected(), paths}); };
     cancel.onclick = () => { finish(null); dialog.close(); };
     dialog.oncancel = event => { event.preventDefault(); finish(null); dialog.close(); };
     dialog.onclose = () => finish(null);
-    update();
+    apkFileSetter = value => { if (!finished) setFiles(value); };
+    if (apkPathList(initialPaths).length) setFiles(initialPaths); else update();
   });
 }
+// An install Android did not confirm in time may still finish: it is neither
+// cancelled nor failed, and must be checked on the device before any retry.
+function apkOutcomeUnknown(message) {
+  return /outcome is unknown|result is unknown|may still complete/i.test(message || '');
+}
 function apkInstallErrorSummary(message) {
+  if (apkOutcomeUnknown(message)) return 'Not confirmed. Check the device before retrying';
+  if (/NO_MATCHING_ABIS/i.test(message)) return 'This app has no build for this device\'s CPU';
+  if (/MISSING_SPLIT/i.test(message)) return 'A required split APK is missing';
   if (/not enough space|insufficient.storage|ENOSPC|no space left/i.test(message)) return 'Not enough Android storage';
   if (/version.downgrade/i.test(message)) return 'A newer version is already installed';
   if (/update.incompatible|signatures? .*match/i.test(message)) return 'APK signature does not match the installed app';
   return 'Installation failed';
 }
-function updateApkProgress(results, total, active = null) {
+// Files that were not installed and expansion files that were left out.
+let apkInstallNotes = '';
+function apkPlanNotes(plan) {
+  const note = (title, text) => `<details class="apk-install-error-detail"><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(text)}</pre></details>`;
+  return plan.rejected.map(item => note(`${item.file} · Not installed`, item.reason)).join('') +
+    plan.packages.filter(item => item.notice).map(item => note(`${item.name} · Expansion files (OBB) not installed`, item.notice)).join('');
+}
+function updateApkProgress(results, total, active = null, step = '') {
   document.getElementById('apk-install-progress').hidden = false;
   const bar = document.getElementById('apk-install-bar');
   bar.max = total; bar.value = results.length;
   bar.className = active ? 'is-installing' : '';
   if (active) bar.removeAttribute('value');
   document.getElementById('apk-install-progress-label').textContent = active
-    ? `Installing ${results.length + 1}/${total} · ${active.name}` : `${results.length}/${total} devices processed`;
+    ? `Installing ${results.length + 1}/${total} · ${active.name}${step ? ` · ${step}` : ''}` : `${results.length}/${total} devices processed`;
   if (active) {
     const state = document.getElementById(`apk-target-state-${active.id}`);
     state.textContent = 'Installing…'; state.className = 'apk-target-state installing';
@@ -1603,13 +1646,20 @@ function updateApkProgress(results, total, active = null) {
     state.textContent = {completed:'Installed', failed:'Failed', skipped:'Skipped'}[result.status];
     state.className = `apk-target-state ${result.status}`;
     state.title = result.message;
-    if (result.status === 'failed') state.textContent += ` · ${apkInstallErrorSummary(result.message)}`;
+    if (result.status === 'failed') {
+      if (result.total > 1) state.textContent += ` · ${result.total - result.installed} of ${result.total} apps`;
+      else if (apkOutcomeUnknown(result.message)) state.textContent = 'Not confirmed · Check the device before retrying';
+      else state.textContent += ` · ${apkInstallErrorSummary(result.message)}`;
+    }
   });
-  document.getElementById('apk-install-error-details').innerHTML = results.filter(result => result.status !== 'completed').map(result => `<details class="apk-install-error-detail"><summary>${escapeHtml(result.name)} · ${escapeHtml(result.status === 'failed' ? apkInstallErrorSummary(result.message) : 'Skipped')}</summary>${/not enough space|insufficient.storage|ENOSPC|no space left/i.test(result.message) ? '<p>Free space on the device data disk, then retry.</p>' : ''}<pre>${escapeHtml(result.message)}</pre></details>`).join('');
+  document.getElementById('apk-install-error-details').innerHTML = apkInstallNotes + results.filter(result => result.status !== 'completed').map(result => `<details class="apk-install-error-detail"><summary>${escapeHtml(result.name)} · ${escapeHtml(result.status !== 'failed' ? 'Skipped' : result.total > 1 ? `${result.total - result.installed} of ${result.total} apps not installed` : apkInstallErrorSummary(result.message))}</summary>${/not enough space|insufficient.storage|ENOSPC|no space left/i.test(result.message) ? '<p>Free space on the device data disk, then retry.</p>' : ''}<pre>${escapeHtml(result.message)}</pre></details>`).join('');
 
 }
-async function runApkInstall(records, ids, path) {
+// Devices one after another; on each device the prepared packages one after
+// another, each as one Android install session.
+async function runApkInstall(records, ids, plan) {
   const results = [];
+  const packages = plan.packages;
   for (const id of ids) {
     const target = records.find(record => record.id === id);
     if (!target) continue;
@@ -1620,26 +1670,43 @@ async function runApkInstall(records, ids, path) {
           (target.generation != null && current.generation !== target.generation)) {
         results.push({id, name:target.name, status:'skipped', message:'Device changed or is no longer available'});
       } else {
-        const result = await tauriInvoke('install_apk', {runtimeId:id, path});
-        results.push({id, name:target.name, status:result?.success ? 'completed' : 'failed', message:result?.message || 'Installation failed'});
+        const outcomes = [];
+        for (const [index, item] of packages.entries()) {
+          if (packages.length > 1) updateApkProgress(results, ids.length, target, `app ${index + 1}/${packages.length}`);
+          let outcome;
+          try {
+            const result = await tauriInvoke('install_prepared_apk', {runtimeId:id, plan:plan.plan, index});
+            outcome = {ok:Boolean(result?.success), message:result?.message || 'Installation failed'};
+          } catch (error) { outcome = {ok:false, message:String(error.message || error)}; }
+          outcomes.push({...outcome, name:item.name});
+        }
+        const failed = outcomes.filter(outcome => !outcome.ok);
+        // With several apps every line names its app; failures come first.
+        const lines = (failed.length ? failed : outcomes).map(outcome => packages.length > 1 ? `${outcome.name}: ${outcome.message}` : outcome.message);
+        results.push({id, name:target.name, status:failed.length ? 'failed' : 'completed', message:lines.join('\n'),
+          installed:outcomes.length - failed.length, total:outcomes.length});
       }
     } catch (error) { results.push({id, name:target.name, status:'failed', message:String(error.message || error)}); }
     updateApkProgress(results, ids.length);
   }
   return results;
 }
-async function installApk() {
+async function installApk(initialPaths = []) {
   if (probeInstallBusy || pendingLaunch || pendingAppAction || runtimeTransition || controllerMutation || runtimeBatchBusy) {
     showAppToast('Wait for the current operation to complete.', 'info'); return;
   }
   pendingAppAction = true;
   apkInstallBusy = true;
+  apkRequestedPath = apkPathList(initialPaths);
+  apkInstallNotes = '';
+  let plan = null;
+  apkChoosing = true;
   renderController(); renderManagedLibraryStatus();
   const dialog = document.getElementById('apk-install-dialog');
   const cancel = document.getElementById('apk-install-cancel');
   const submit = document.getElementById('apk-install-submit');
   const form = document.getElementById('apk-install-form');
-  document.getElementById('apk-install-file').textContent = 'No APK selected';
+  showApkSelection(apkRequestedPath);
   document.getElementById('apk-install-targets').textContent = 'Loading devices…';
   document.getElementById('apk-install-error').textContent = '';
   document.getElementById('apk-install-error-details').innerHTML = '';
@@ -1650,11 +1717,14 @@ async function installApk() {
   document.getElementById('apk-install-pick').disabled = true;
   submit.hidden = false; submit.disabled = true;
   cancel.disabled = false; cancel.textContent = 'Cancel'; cancel.onclick = () => dialog.close();
-  dialog.showModal();
+  // Files opened or dropped while the last results are still shown start over
+  // in the same dialog; showModal() on an open dialog would throw.
+  if (!dialog.open) dialog.showModal();
   try {
     const records = await loadApkTargets();
     if (!dialog.open) return;
-    const choice = await chooseApkTargets(records);
+    const choice = await chooseApkTargets(records, apkRequestedPath);
+    apkChoosing = false;
     if (!choice) return;
     document.getElementById('apk-install-pick').hidden = true;
     document.getElementById('apk-install-target-hint').textContent = 'Target devices';
@@ -1663,12 +1733,28 @@ async function installApk() {
     submit.hidden = true; cancel.disabled = true;
     form.onsubmit = event => event.preventDefault();
     dialog.oncancel = event => event.preventDefault();
-    const results = await runApkInstall(records, choice.ids, choice.path);
+    // Inspect the files once: group APKs by app and unpack bundles.
+    document.getElementById('apk-install-progress').hidden = false;
+    document.getElementById('apk-install-bar').removeAttribute('value');
+    document.getElementById('apk-install-progress-label').textContent = 'Preparing files…';
+    plan = await tauriInvoke('prepare_apk_install', {paths:choice.paths});
+    if (!Array.isArray(plan?.packages) || !Array.isArray(plan?.rejected)) throw new Error('Invalid install plan.');
+    apkInstallNotes = apkPlanNotes(plan);
+    if (!plan.packages.length) {
+      updateApkProgress([], choice.ids.length);
+      document.getElementById('apk-install-bar').value = 0;
+      document.getElementById('apk-install-progress-label').textContent = 'Nothing was installed';
+      choice.ids.forEach(id => { document.getElementById(`apk-target-state-${id}`).textContent = 'Not started'; });
+      document.getElementById('apk-install-error').textContent = 'None of the selected files can be installed. See the reasons below.';
+      return;
+    }
+    const results = await runApkInstall(records, choice.ids, plan);
     const completed = results.filter(result => result.status === 'completed').length;
     const failed = results.filter(result => result.status === 'failed').length;
     const skipped = results.filter(result => result.status === 'skipped').length;
-    document.getElementById('apk-install-progress-label').textContent = `${completed} completed · ${failed} failed · ${skipped} skipped`;
-    if (completed) await Promise.allSettled([refreshApps(), refreshManagedLibrary()]);
+    document.getElementById('apk-install-progress-label').textContent = `${completed} completed · ${failed} failed · ${skipped} skipped` +
+      (plan.rejected.length ? ` · ${plan.rejected.length} ${plan.rejected.length === 1 ? 'file' : 'files'} not installed` : '');
+    if (completed || results.some(result => apkOutcomeUnknown(result.message))) await Promise.allSettled([refreshApps(), refreshManagedLibrary()]);
   } catch (err) { document.getElementById('apk-install-error').textContent = String(err.message || err); }
   finally {
     dialog.oncancel = dialog.onclose = null;
@@ -1676,10 +1762,59 @@ async function installApk() {
     submit.disabled = true;
     cancel.disabled = false; cancel.textContent = 'Close'; cancel.onclick = () => dialog.close();
     pendingAppAction = false; apkInstallBusy = false;
+    apkChoosing = false; apkRequestedPath = []; apkFileSetter = null;
+    // The backend removes the unpacked files of this selection.
+    if (plan?.plan != null) tauriInvoke('discard_apk_install', {plan:plan.plan}).catch(() => {});
     renderController(); renderManagedLibraryStatus();
   }
 }
-btnInstallApk.addEventListener('click', installApk);
+btnInstallApk.addEventListener('click', () => installApk());
+
+// Opening package files from the file manager starts AnvilDroid, or reaches
+// the running window, with the files waiting in the backend.
+function apkOpenBlocked() {
+  return Boolean(probeInstallBusy || pendingLaunch || pendingAppAction || runtimeTransition || controllerMutation || runtimeBatchBusy);
+}
+let apkOpenWaiting = null;
+async function openApkFile(path) {
+  const paths = apkPathList(path);
+  if (!paths.length) return;
+  if (apkChoosing) {
+    apkRequestedPath = paths;
+    showApkSelection(paths);
+    apkFileSetter?.(paths);
+    return;
+  }
+  // Startup work and short operations finish on their own; wait for them
+  // instead of dropping the files. A newer selection replaces a waiting one.
+  const waiting = apkOpenWaiting = {};
+  for (let attempt = 0; attempt < 40 && apkOpenBlocked(); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (apkOpenWaiting !== waiting) return;
+    if (apkChoosing) { openApkFile(paths); return; }
+  }
+  apkOpenWaiting = null;
+  if (apkOpenBlocked()) {
+    showAppToast(`Cannot install ${apkSelectionLabel(paths)} while another operation is running. Open ${paths.length === 1 ? 'the file' : 'the files'} again when it completes.`, 'error');
+    return;
+  }
+  await installApk(paths);
+}
+async function openPendingApk() {
+  let paths = [];
+  try { paths = apkPathList(await tauriInvoke('take_pending_apk')); }
+  catch { return; }
+  if (paths.length) await openApkFile(paths);
+}
+window.__TAURI__?.event?.listen?.('open-apk', () => { openPendingApk(); })?.catch?.(() => {});
+// Files dropped on the window open the same dialog with those files selected.
+function openDroppedFiles(dropped) {
+  const paths = apkPathList(dropped);
+  const packages = paths.filter(path => APK_FILE_TYPES.includes(apkFileName(path).split('.').pop().toLowerCase()));
+  if (packages.length) openApkFile(packages);
+  else if (paths.length) showAppToast('Drop .apk, .apks, .xapk or .apkm files to install them.', 'info');
+}
+if (!openControlsOnLaunch) window.__TAURI__?.event?.listen?.('tauri://drag-drop', event => { openDroppedFiles(event?.payload?.paths); })?.catch?.(() => {});
 
 // Browsing and refreshing never start Android. Explicit launch/start owns boot.
 let appLibraryStarted = false;
@@ -2199,8 +2334,18 @@ function featureTools() {
       shares: AnvilRuntimeShares.create({request:controllerRequest, document, toast:showAppToast,
         chooseDirectory:() => window.__TAURI__.dialog.open({directory:true, multiple:false, title:'Choose a folder to share with Android'})}),
       tools: AnvilRuntimeTools.create({invoke:tauriInvoke, document, toast:showAppToast,
-        chooseReport:defaultPath => window.__TAURI__.dialog.save({defaultPath, title:'Save diagnostic report', filters:[{name:'Diagnostic JSON report', extensions:['json']}]})})
+        chooseReport:defaultPath => window.__TAURI__.dialog.save({defaultPath, title:'Save diagnostic report', filters:[{name:'Diagnostic JSON report', extensions:['json']}]})}),
+      backups: AnvilRuntimeBackups.create({request:controllerRequest, document, toast:showAppToast,
+        confirm:(text, options) => AppDialog.confirm(text, options), showProgress:showProgressToast, clearProgress:clearProgressToast})
     };
+    // Device tools that query a running Android (services/runtime-inspect.py).
+    const deviceTool = {request:controllerRequest, invoke:tauriInvoke, document, toast:showAppToast,
+      confirm:(text, options) => AppDialog.confirm(text, options), dialog:window.__TAURI__.dialog,
+      showProgress:showProgressToast, clearProgress:clearProgressToast};
+    runtimeFeatureTools.network = AnvilRuntimeNetwork.create(deviceTool);
+    runtimeFeatureTools.logs = AnvilRuntimeLogs.create(deviceTool);
+    runtimeFeatureTools.activity = AnvilRuntimeActivity.create(deviceTool);
+    runtimeFeatureTools.capture = AnvilRuntimeCapture.create(deviceTool);
   }
   return runtimeFeatureTools;
 }
@@ -2208,10 +2353,11 @@ function syncRuntimeSettingsFeatures() {
   const record = currentPage === 'runtime-settings' ? runtimeRecord(runtimeSettingsId) : null;
   const available = record && !record.unavailable && !record.refreshError && !record.detailsLoading && !record.deletion_pending;
   const page = document.getElementById('page-runtime-settings');
-  for (const [kind, attribute] of [['shares','runtime-shares'], ['tools','runtime-diagnostics']]) {
+  for (const [kind, attribute] of [['shares','runtime-shares'], ['tools','runtime-diagnostics'], ['backups','runtime-backups'],
+      ['network','runtime-network'], ['logs','runtime-logs'], ['activity','runtime-activity'], ['capture','runtime-capture']]) {
     const host = available ? page.querySelector(`[data-${attribute}="${record.id}"]`) : null;
     if (host?.closest('details[data-settings-key]')?.open) featureTools()[kind].mount(host, record);
-    else runtimeFeatureTools?.[kind].deactivate();
+    else runtimeFeatureTools?.[kind]?.deactivate();
   }
 }
 
@@ -2280,6 +2426,11 @@ function renderExistingRuntime() {
     <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:gpu" ${runtimeSettingsOpen.has(record.id + ':gpu') ? 'open' : ''}><summary>Graphics</summary><div class="runtime-gpu-panel runtime-primary-setting" id="runtime-gpu-default">${renderGpuControls(record,busy)}<div class="runtime-actions" data-level="advanced">${button('gpu_check','Check GPU',controllerMutation)}</div><div data-level="advanced">${renderRuntimeGraphics('default')}</div></div></details>
     <div class="runtime-config-grid">
       <details class="runtime-settings-group" data-level="advanced" data-settings-key="${escapeHtml(record.id)}:storage" ${runtimeSettingsOpen.has(record.id + ':storage') ? 'open' : ''}><summary>Storage</summary><div class="runtime-storage-panel"><p class="runtime-storage-path">${escapeHtml(record.storage?.path || record.storageError || 'Unavailable')}</p>${record.storage ? `<p>Disk free: ${(record.storage.free_bytes / 1024**3).toFixed(2)} / ${(record.storage.total_bytes / 1024**3).toFixed(2)} GiB</p>` : ''}<p class="hint">Shared filesystem; no disk quota.</p><div data-runtime-shares="default"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:backups" ${runtimeSettingsOpen.has(record.id + ':backups') ? 'open' : ''}><summary>Backups</summary><div class="runtime-backups-panel"><div data-runtime-backups="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:network" ${runtimeSettingsOpen.has(record.id + ':network') ? 'open' : ''}><summary>Network</summary><div class="runtime-network-panel"><div data-runtime-network="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-level="advanced" data-settings-key="${escapeHtml(record.id)}:logs" ${runtimeSettingsOpen.has(record.id + ':logs') ? 'open' : ''}><summary>Logs</summary><div class="runtime-logs-panel"><div data-runtime-logs="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:activity" ${runtimeSettingsOpen.has(record.id + ':activity') ? 'open' : ''}><summary>Activity</summary><div class="runtime-activity-panel"><div data-runtime-activity="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:capture" ${runtimeSettingsOpen.has(record.id + ':capture') ? 'open' : ''}><summary>Screenshot</summary><div class="runtime-capture-panel"><div data-runtime-capture="${escapeHtml(record.id)}"></div></div></details>
       <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:arm" ${runtimeSettingsOpen.has(record.id + ':arm') ? 'open' : ''}><summary>ARM translation</summary><div class="runtime-arm-panel">${renderRuntimeArm(record,busy)}</div></details>
       <div class="runtime-settings-list runtime-settings-visible">
       ${renderRuntimeDevice(record, busy)}
@@ -3201,6 +3352,11 @@ function renderController() {
         ${record.storage?.job?.error || record.storage?.error ? `<p class="runtime-feedback error" role="alert">${escapeHtml(record.storage.error || record.storage.job.error)}</p>` : ''}
         <div data-runtime-shares="${escapeHtml(record.id)}"></div>
       </div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:backups" ${runtimeSettingsOpen.has(record.id + ':backups') ? 'open' : ''}><summary>Backups</summary><div class="runtime-backups-panel"><div data-runtime-backups="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:network" ${runtimeSettingsOpen.has(record.id + ':network') ? 'open' : ''}><summary>Network</summary><div class="runtime-network-panel"><div data-runtime-network="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-level="advanced" data-settings-key="${escapeHtml(record.id)}:logs" ${runtimeSettingsOpen.has(record.id + ':logs') ? 'open' : ''}><summary>Logs</summary><div class="runtime-logs-panel"><div data-runtime-logs="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:activity" ${runtimeSettingsOpen.has(record.id + ':activity') ? 'open' : ''}><summary>Activity</summary><div class="runtime-activity-panel"><div data-runtime-activity="${escapeHtml(record.id)}"></div></div></details>
+      <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:capture" ${runtimeSettingsOpen.has(record.id + ':capture') ? 'open' : ''}><summary>Screenshot</summary><div class="runtime-capture-panel"><div data-runtime-capture="${escapeHtml(record.id)}"></div></div></details>
       <details class="runtime-settings-group" data-settings-key="${escapeHtml(record.id)}:arm" ${runtimeSettingsOpen.has(record.id + ':arm') ? 'open' : ''}><summary>ARM translation</summary><div class="runtime-arm-panel">${renderRuntimeArm(record, busy)}</div></details>
       <div class="runtime-settings-list runtime-settings-visible">
       ${renderRuntimeDevice(record, busy)}
@@ -3451,8 +3607,12 @@ async function mutateController(request) {
     if (request.op === 'existing_import' && !await AppDialog.confirm(
       'Copy System Waydroid images, apps and Android data into a new managed device? This requires extra disk space. Keep System Waydroid stopped until copying and verification finish. The original is retained. App logins and device-bound credentials may require signing in again.',
       {title:'Import System Waydroid',kind:'info'})) return;
+    // Reinstall erases Android data: offer a backup before the final confirmation.
+    const backups = request.op === 'reinstall' ? window.AnvilRuntimeBackups : null;
+    const backupFirst = Boolean(backups) && await backups.offerBeforeReinstall({request:controllerRequest,
+      confirm:(text, options) => AppDialog.confirm(text, options), id:request.id, name:runtimeRecord(request.id)?.name || 'this device'});
     if (request.op === 'reinstall' && !await AppDialog.confirm(
-      `Reinstall this device with ${imageForRequest(request)?.custom_name || (request.flavor === 'installed' ? 'Existing Waydroid image' : 'Waydroid ' + request.flavor)}?\nSystem SHA-256: ${request.system_sha256 || 'installed source'}\n\nAndroid will stop first if running. All apps, data and settings will be erased, then Android starts again. This cannot be undone.`,
+      `Reinstall this device with ${imageForRequest(request)?.custom_name || (request.flavor === 'installed' ? 'Existing Waydroid image' : 'Waydroid ' + request.flavor)}?\nSystem SHA-256: ${request.system_sha256 || 'installed source'}\n\nAndroid will stop first if running. All apps, data and settings will be erased, then Android starts again. This cannot be undone.${backupFirst ? '\n\nAndroid data is backed up first. If the backup fails, nothing is erased.' : ''}`,
       {title:'Reinstall device',kind:'warning'})) return;
     if (request.op === 'app_action') {
       controllerPending.phase = 'confirm'; renderController();
@@ -3474,6 +3634,16 @@ async function mutateController(request) {
         renderController();
       },
     });
+    if (backupFirst) {
+      message.textContent = 'Backing up Android data before reinstall…';
+      try {
+        await backups.run({request:controllerRequest, id:request.id, name:runtimeRecord(request.id)?.name || 'this device',
+          start:{op:'backup_create', id:request.id}, showProgress:showProgressToast, clearProgress:clearProgressToast});
+      } catch (error) {
+        throw new Error(`${error.cancelled ? 'The backup was cancelled' : 'The backup failed: ' + String(error.message || error)}. The device was not reinstalled and nothing was erased.`);
+      }
+      message.textContent = 'Reinstalling…';
+    }
     let {result, restarted} = request.id
       ? await RuntimeSettings.apply(request, {
         send: controllerRequest,
@@ -3862,7 +4032,7 @@ function openRuntimeStorage(id, operation) {
   const removing = deleting || operation === 'discard_previous';
   document.getElementById('runtime-storage-title').textContent = deleting ? `Delete ${record.name}` : removing ? 'Remove retained copy' : `Move ${record.name}`;
   document.getElementById('runtime-storage-description').textContent = deleting
-    ? `Permanently delete device "${record.name}" (${record.id}) and all its apps, app data, images and retained storage copies? This cannot be undone. Storage: ${record.storage?.path || 'This runtime’s storage'}. Type the device name to confirm.`
+    ? `Permanently delete device "${record.name}" (${record.id}) and all its apps, app data, images, backups and retained storage copies? This cannot be undone. Storage: ${record.storage?.path || 'This runtime’s storage'}. Type the device name to confirm.`
     : removing
     ? `Only this retained copy will be deleted: ${record.storage.previous_path}. The active device at ${record.storage.path} will be kept.`
     : `Current location: ${record.storage.path}. Choose a permanent local Linux folder owned by your account. Data, images and settings will be copied and verified. The old copy is retained until you remove it. Android must be stopped.`;
@@ -4671,6 +4841,7 @@ document.addEventListener('change', event => {
 
 // Start only after all runtime request helpers have been initialized.
 if (!openSettingsOnLaunch && !openControlsOnLaunch) pageLoads.schedule('apps', () => libraryPage, initializeAppLibrary);
+openPendingApk();
 
 // The search shortcut is scoped to the app window and leaves modal dialogs alone.
 document.addEventListener('keydown', event => {
@@ -4763,7 +4934,7 @@ function showRuntimeBatchDialog(op, selected, label) {
   const destructive = ['delete', 'reinstall'].includes(op);
   document.getElementById('runtime-batch-title').textContent = `${label} ${targets.length} ${targets.length === 1 ? 'runtime' : 'runtimes'}`;
   document.getElementById('runtime-batch-description').textContent = (destructive
-    ? op === 'delete' ? 'Permanently remove these devices, apps, data and retained storage copies. This cannot be undone.' : 'Replace these devices with the selected image. All existing apps, data and settings will be erased. This cannot be undone.'
+    ? op === 'delete' ? 'Permanently remove these devices, apps, data, backups and retained storage copies. This cannot be undone.' : 'Replace these devices with the selected image. All existing apps, data and settings will be erased. This cannot be undone.'
     : op === 'open' ? 'Open a Waydroid window for each running Desktop device below.' : op === 'start' ? 'Start these devices in order.' : 'Apps will close; saved data is retained. Devices are processed in order.') +
     (runtimeBatchPlan.skipped ? ` ${runtimeBatchPlan.skipped} unavailable runtime(s) will be skipped.` : '');
   document.getElementById('runtime-batch-targets').innerHTML = targets.map(record => `<li>${escapeHtml(record.name)}</li>`).join('');
