@@ -73,10 +73,11 @@ class ShaderCacheTests(unittest.TestCase):
                 adapter.return_value.desktop_overlay.return_value = True
                 integration.props({}, session, target)
                 self.assertEqual(target.read_text().splitlines(), ['keep=yes', 'persist.waydroid.multi_windows=true'])
-                # A value Waydroid itself was given stays.
-                content[0] = 'persist.waydroid.multi_windows=false\n'
+                # The bridge shows every app as a desktop window, which needs
+                # freeform tasks: an older value does not switch that off.
+                content[0] = 'persist.waydroid.multi_windows=false\nkeep=yes\n'
                 integration.props({}, session, target)
-                self.assertEqual(target.read_text().splitlines(), ['persist.waydroid.multi_windows=false'])
+                self.assertEqual(target.read_text().splitlines(), ['keep=yes', 'persist.waydroid.multi_windows=true'])
                 # Without the desktop bridge the session stays stock.
                 content[0] = 'keep=yes\n'
                 adapter.return_value.desktop_overlay.return_value = False
