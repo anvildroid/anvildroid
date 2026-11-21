@@ -108,10 +108,16 @@ class HostBinderTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'must be empty'): self.prepare()
         self.assertEqual(self.run.call_count, 1)
     def test_empty_unmounted_directory_mounted_once_before_allocation(self):
-        with patch('builtins.open', return_value=io.StringIO('')): self.prepare()
+        with patch('builtins.open', side_effect=lambda *args, **kwargs: io.StringIO('')): self.prepare()
         commands = [call.args[:4] for call in self.run.call_args_list]
         self.assertEqual(commands[1], ('modprobe', 'binder_linux'))
         self.assertEqual(commands[2], ('mount', '-t', 'binder', 'binder'))
+    def test_builtin_binder_mounts_without_module(self):
+        streams = [io.StringIO(''), io.StringIO('nodev\tsysfs\nnodev\tbinder\n')]
+        with patch('builtins.open', side_effect=lambda *args, **kwargs: streams.pop(0)): self.prepare()
+        commands = [call.args[:4] for call in self.run.call_args_list]
+        self.assertNotIn(('modprobe', 'binder_linux'), commands)
+        self.assertEqual(commands[1], ('mount', '-t', 'binder', 'binder'))
     def test_bad_configured_names_fail_before_actions(self):
         for bad in ('../binder', '/dev/binder', 'a/b', 'binder-control', '', None):
             with self.subTest(name=bad):
