@@ -403,7 +403,9 @@ fn persistent_executable() -> Result<PathBuf, String> {
     Ok(std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_file())
-        .unwrap_or(std::env::current_exe().map_err(|e| e.to_string())?))
+        .unwrap_or(anvildroid_core::desktop::stable_launcher(
+            std::env::current_exe().map_err(|e| e.to_string())?,
+        )))
 }
 
 /// Keep the login entry in step with "start at login" runtimes.

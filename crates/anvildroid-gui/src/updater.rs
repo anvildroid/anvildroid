@@ -1,5 +1,6 @@
 //! In-app updates from GitHub Releases, installed the same way AnvilDroid was:
 //! a .deb/.rpm/Arch package through pkexec, or an AppImage replaced in place.
+//! Nix installs only report new releases: the system configuration owns them.
 //! Every download is checked against the release's SHA256SUMS before use.
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -20,6 +21,7 @@ const ASSET_REPOS: [&str; 2] = [REPO, "collyn/anvildroid"];
 /// Signed APT/RPM/Arch repositories published by CI (scripts/publish-repos.sh).
 pub const PAGES: &str = "https://anvildroid.github.io/packages";
 const PACKAGE: &str = "anvildroid-controller";
+const NIX_UPDATE: &str = "This copy is managed by Nix; update the anvildroid flake input and rebuild your system.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,13 +30,17 @@ pub enum Kind {
     Rpm,
     Pacman,
     Appimage,
+    Nix,
     Portable,
 }
 
 /// How this copy was installed. `root` is "/" except in tests.
-fn kind_at(appimage: Option<PathBuf>, root: &Path, rpm_installed: impl Fn() -> bool) -> Kind {
+fn kind_at(appimage: Option<PathBuf>, exe: Option<PathBuf>, root: &Path, rpm_installed: impl Fn() -> bool) -> Kind {
     if appimage.is_some_and(|path| path.is_absolute() && path.is_file()) {
         return Kind::Appimage;
+    }
+    if exe.is_some_and(|path| path.starts_with("/nix/store")) {
+        return Kind::Nix;
     }
     if root.join("var/lib/dpkg/info").join(format!("{PACKAGE}.list")).is_file() {
         return Kind::Deb;
@@ -54,7 +60,7 @@ fn kind_at(appimage: Option<PathBuf>, root: &Path, rpm_installed: impl Fn() -> b
 }
 
 pub fn install_kind() -> Kind {
-    kind_at(std::env::var_os("APPIMAGE").map(PathBuf::from), Path::new("/"), || {
+    kind_at(std::env::var_os("APPIMAGE").map(PathBuf::from), std::env::current_exe().ok(), Path::new("/"), || {
         Command::new("rpm").args(["-q", PACKAGE]).stdout(Stdio::null()).stderr(Stdio::null())
             .status().is_ok_and(|status| status.success())
     })
@@ -67,7 +73,7 @@ fn asset_matches(kind: Kind, name: &str) -> bool {
         Kind::Rpm => name.starts_with(&format!("{PACKAGE}-")) && name.ends_with(".x86_64.rpm"),
         Kind::Pacman => name.starts_with(&format!("{PACKAGE}-")) && name.ends_with("-x86_64.pkg.tar.zst"),
         Kind::Appimage => name.starts_with("AnvilDroid-") && name.ends_with("-x86_64.AppImage"),
-        Kind::Portable => false,
+        Kind::Nix | Kind::Portable => false,
     }
 }
 
@@ -201,6 +207,9 @@ pub fn start() -> Result<Value, String> {
     if kind == Kind::Portable {
         return Err("This copy was not installed from a package or AppImage; download the new release manually.".into());
     }
+    if kind == Kind::Nix {
+        return Err(NIX_UPDATE.into());
+    }
     publish(json!({"status": "Downloading", "percent": 0, "phase": "Checking the latest release"}));
     std::thread::spawn(move || {
         if let Err(error) = run(kind) {
@@ -312,6 +321,7 @@ fn install(kind: Kind, package: &Path) -> Result<(), String> {
         Kind::Pacman => ("/usr/bin/pacman", vec!["-U".into(), "--noconfirm".into(), path]),
         Kind::Appimage => return replace_appimage(package),
         Kind::Portable => return Err("Portable copies are updated manually".into()),
+        Kind::Nix => return Err(NIX_UPDATE.into()),
     };
     let result = crate::run_privileged(program, &args, Duration::from_secs(1800))?;
     if result.ok { Ok(()) } else { Err(result.message) }
@@ -338,6 +348,7 @@ pub fn relaunch_path() -> Option<PathBuf> {
     match install_kind() {
         Kind::Appimage => std::env::var_os("APPIMAGE").map(PathBuf::from),
         Kind::Portable => std::env::current_exe().ok(),
+        Kind::Nix => std::env::current_exe().ok().map(anvildroid_core::desktop::stable_launcher),
         _ => Some(PathBuf::from("/usr/bin/anvildroid-gui")),
     }
 }
@@ -365,18 +376,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("var/lib/dpkg/info")).unwrap();
         fs::create_dir_all(root.join("var/lib/pacman/local")).unwrap();
-        assert_eq!(kind_at(None, &root, || false), Kind::Portable);
-        assert_eq!(kind_at(None, &root, || true), Kind::Rpm);
+        assert_eq!(kind_at(None, None, &root, || false), Kind::Portable);
+        assert_eq!(kind_at(None, None, &root, || true), Kind::Rpm);
         fs::create_dir(root.join("var/lib/pacman/local/anvildroid-controller-tools-1")).unwrap();
-        assert_eq!(kind_at(None, &root, || false), Kind::Portable); // another package
+        assert_eq!(kind_at(None, None, &root, || false), Kind::Portable); // another package
         fs::create_dir(root.join("var/lib/pacman/local/anvildroid-controller-0.1.6-1")).unwrap();
-        assert_eq!(kind_at(None, &root, || false), Kind::Pacman);
+        assert_eq!(kind_at(None, None, &root, || false), Kind::Pacman);
         fs::write(root.join("var/lib/dpkg/info/anvildroid-controller.list"), "").unwrap();
-        assert_eq!(kind_at(None, &root, || false), Kind::Deb);
+        assert_eq!(kind_at(None, None, &root, || false), Kind::Deb);
         let image = root.join("AnvilDroid.AppImage");
         fs::write(&image, "").unwrap();
-        assert_eq!(kind_at(Some(image), &root, || false), Kind::Appimage);
-        assert_eq!(kind_at(Some(PathBuf::from("relative.AppImage")), &root, || false), Kind::Deb);
+        assert_eq!(kind_at(Some(image), None, &root, || false), Kind::Appimage);
+        let store = Some(PathBuf::from("/nix/store/abc-anvildroid/bin/.anvildroid-gui-wrapped"));
+        assert_eq!(kind_at(None, store, &root, || false), Kind::Nix);
+        assert_eq!(kind_at(Some(PathBuf::from("relative.AppImage")), None, &root, || false), Kind::Deb);
         fs::remove_dir_all(root).unwrap();
     }
 

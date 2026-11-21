@@ -311,6 +311,11 @@ target/releases/anvildroid-controller-<VERSION>-1-x86_64.pkg.tar.zst
 target/releases/<VERSION>/AnvilDroid-<VERSION>-x86_64.AppImage
 ```
 
+NixOS has no build step of its own: the flake (`flake.nix`,
+`packaging/nixos/`) repackages the released Arch package pinned in
+`packaging/nixos/sources.json`. The release workflow updates that pin and opens
+a pull request after each release; see `packaging/nixos/README.md`.
+
 The native X11 adapter is built locally from the development libraries above;
 CI can supply a verified payload with `ANVILDROID_X11_PAYLOAD=/abs/path`. For
 the Ubuntu 24.04 glibc baseline, build it in a 24.04 container
