@@ -1832,7 +1832,7 @@ function initializeAppLibrary() {
 // P5.3.0: configured file values are deliberately distinct from live readings.
 // --- Updates (GitHub Releases, installed like this copy was) ---
 const UPDATE_NOTIFY_KEY = 'anvildroid.updateNotify';
-const UPDATE_KIND_LABELS = {deb:'Debian/Ubuntu package', rpm:'RPM package', pacman:'Arch Linux package', appimage:'AppImage', portable:'portable copy'};
+const UPDATE_KIND_LABELS = {deb:'Debian/Ubuntu package', rpm:'RPM package', pacman:'Arch Linux package', appimage:'AppImage', nix:'Nix package', portable:'portable copy'};
 const UPDATE_REPO_SCRIPTS = {deb:'install.sh', rpm:'install-fedora.sh', pacman:'install-arch.sh'};
 let updateInfo = null, updateJob = null, updateChecking = false, updatePollTimer = null;
 function renderUpdate() {
@@ -1860,6 +1860,8 @@ function renderUpdate() {
   else if (updateInfo?.update_available && !updateInfo.installable)
     text = updateInfo.kind === 'portable'
       ? `AnvilDroid ${updateInfo.latest} is available. Download it from the release page.`
+      : updateInfo.kind === 'nix'
+      ? `AnvilDroid ${updateInfo.latest} is available. Update the anvildroid flake input, then rebuild your system.`
       : `AnvilDroid ${updateInfo.latest} is available, but this release has no ${UPDATE_KIND_LABELS[updateInfo.kind] || 'matching package'}.`;
   else if (updateInfo?.update_available) text = `AnvilDroid ${updateInfo.latest} is available.`;
   else if (updateInfo) text = 'AnvilDroid is up to date.';

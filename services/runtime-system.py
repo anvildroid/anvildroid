@@ -106,8 +106,12 @@ def prepare_host_binder(tools, args, dev=Path('/dev')):
     if mounted is None:
         if binderfs.is_symlink() or binderfs.exists() and any(binderfs.iterdir()):
             raise RuntimeError('Default Binder directory must be empty before mounting')
-        existing.linux.run_bounded('modprobe', 'binder_linux', timeout=10,
-                                  operation='Default Binder module preparation')
+        # Built-in Binder (NixOS and other kernels with =y) has no module.
+        with open('/proc/filesystems') as stream:
+            builtin = any(line.split()[-1:] == ['binder'] for line in stream)
+        if not builtin:
+            existing.linux.run_bounded('modprobe', 'binder_linux', timeout=10,
+                                      operation='Default Binder module preparation')
         binderfs.mkdir(mode=0o755, exist_ok=True)
         existing.linux.run_bounded('mount', '-t', 'binder', 'binder', binderfs, timeout=5,
                                   operation='Default host Binder filesystem')

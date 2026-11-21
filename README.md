@@ -64,6 +64,22 @@ curl -fsSL https://anvildroid.github.io/packages/install-opensuse.sh | sudo bash
 curl -fsSL https://anvildroid.github.io/packages/install-arch.sh | sudo bash
 ```
 
+**NixOS** (flake; installs the prebuilt release, nothing is compiled)
+
+```nix
+# /etc/nixos/flake.nix
+inputs.anvildroid = {
+  url = "github:anvildroid/anvildroid";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+# in nixosSystem { modules = [ ... ]; }:
+anvildroid.nixosModules.default
+{ programs.anvildroid.enable = true; }
+```
+
+Then `sudo nixos-rebuild switch`. Details and options:
+[packaging/nixos/README.md](packaging/nixos/README.md).
+
 **AppImage (any distribution):** download `AnvilDroid-<version>-x86_64.AppImage`
 from the [latest release](https://github.com/anvildroid/anvildroid/releases/latest),
 make it executable and run it. It installs the runtime controller on first use

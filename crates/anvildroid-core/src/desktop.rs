@@ -10,7 +10,28 @@ use std::{
 const OWNER: &str = "X-AnvilDroid-Managed=true";
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+/// Launcher the NixOS module keeps pointing at the current build.
+pub const NIX_LAUNCHER: &str = "/usr/bin/anvildroid-gui";
+
+/// Nix store paths change on every upgrade and are garbage-collected later,
+/// so desktop entries must not name them; use the module's stable launcher.
+pub fn stable_launcher(resolved: PathBuf) -> PathBuf {
+    stable_launcher_at(resolved, Path::new(NIX_LAUNCHER))
+}
+
+fn stable_launcher_at(resolved: PathBuf, launcher: &Path) -> PathBuf {
+    if resolved.starts_with("/nix/store") && launcher.is_file() {
+        launcher.to_path_buf()
+    } else {
+        resolved
+    }
+}
+
 pub(crate) fn installed_launcher(path: &Path) -> std::io::Result<PathBuf> {
+    resolve_launcher(path).map(stable_launcher)
+}
+
+fn resolve_launcher(path: &Path) -> std::io::Result<PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -600,6 +621,14 @@ mod tests {
             Path::new("/tmp/gui")
         )
         .is_err());
+    }
+    #[test]
+    fn nix_store_launchers_use_the_stable_path() {
+        let exe = std::env::current_exe().unwrap();
+        let store = PathBuf::from("/nix/store/abc-anvildroid/bin/.anvildroid-gui-wrapped");
+        assert_eq!(stable_launcher_at(store.clone(), &exe), exe);
+        assert_eq!(stable_launcher_at(store.clone(), Path::new("/nonexistent/anvildroid-gui")), store);
+        assert_eq!(stable_launcher_at(PathBuf::from("/usr/bin/anvildroid-gui"), &exe), PathBuf::from("/usr/bin/anvildroid-gui"));
     }
     #[test]
     fn resolves_replaced_executable_after_package_upgrade() {
